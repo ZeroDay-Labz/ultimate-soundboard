@@ -540,10 +540,19 @@ impl SoundboardApp {
         let mut files = Vec::new();
         let mut zips = Vec::new();
         let mut swfs = Vec::new();
+        let mut unrecognized: Vec<String> = Vec::new();
 
         for f in dropped {
             let path = f.path().to_path_buf();
+            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("(unnamed)").to_string();
             let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
+
+            if !path.exists() {
+                log::warn!("dropped item has no on-disk path (or app can't see it): {path:?}");
+                unrecognized.push(format!("{name} (no readable file path -- if this came straight from Discord's window, try Save As to a folder first, then drag that file)"));
+                continue;
+            }
+
             if path.is_dir() {
                 folders.push(path);
             } else if ext.as_deref() == Some("zip") {
@@ -552,9 +561,13 @@ impl SoundboardApp {
                 swfs.push(path);
             } else if util::is_audio_file(&path) {
                 files.push(path);
+            } else {
+                log::warn!("dropped file not recognized as audio/zip/swf: {path:?} (ext: {ext:?})");
+                unrecognized.push(name);
             }
         }
 
+        let folders_added: usize = folders.len();
         for folder in folders {
             self.add_tab_from_folder(&folder);
         }
@@ -564,7 +577,14 @@ impl SoundboardApp {
         for swf in swfs {
             self.start_swf_rip(swf);
         }
+        let files_count = files.len();
         self.add_files_to_current_tab(files);
+
+        if files_count == 0 && zips.is_empty() && folders_added == 0 && !unrecognized.is_empty() {
+            for name in unrecognized.iter().take(3) {
+                self.toasts.warning(format!("Not added: {name}"));
+            }
+        }
     }
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
