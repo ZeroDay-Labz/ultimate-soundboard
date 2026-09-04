@@ -14,10 +14,18 @@ pub fn resample_stereo(
 ) -> Result<(Vec<f32>, Vec<f32>)> {
     let ratio = to_rate as f64 / from_rate as f64;
 
+    // Building the sinc filter table is the dominant cost of constructing
+    // a resampler (roughly proportional to sinc_len * oversampling_factor),
+    // and we build a fresh one per decode (see `engine.rs`'s decode cache
+    // -- this only runs once per distinct file, not per play, but still
+    // matters for how fast a prewarm queue or a first click clears).
+    // 128/128 is a solid quality/speed tradeoff for a soundboard's short
+    // clips -- well beyond audible transparency, at roughly a quarter of
+    // the 256/256 setup cost.
     let params = SincInterpolationParameters {
-        sinc_len: 256,
+        sinc_len: 128,
         f_cutoff: 0.95,
-        oversampling_factor: 256,
+        oversampling_factor: 128,
         interpolation: SincInterpolationType::Linear,
         window: WindowFunction::BlackmanHarris2,
     };

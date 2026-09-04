@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -14,7 +13,12 @@ use super::decode::{self, Decoded};
 use super::devices;
 use super::pitch;
 
-const DECODE_CACHE_CAPACITY: usize = 64;
+// Byte-budgeted, not item-count-limited: a big single tab's worth of
+// sounds (the Realm of Darkness scraper alone can pull down 150+ per
+// board) should fit comfortably without forcing an explicit "drop the
+// old tab's cache" step -- plain LRU eviction naturally ages out
+// whichever tab hasn't been visited recently once the budget is hit.
+const DECODE_CACHE_MAX_BYTES: usize = 512 * 1024 * 1024;
 const WORKER_COUNT: usize = 2;
 
 /// A request to play one sound. Volume and pitch are already resolved to
@@ -24,6 +28,16 @@ pub struct PlayJob {
     pub path: PathBuf,
     pub volume: f32,
     pub pitch_semitones: f32,
+}
+
+enum EngineJob {
+    Play(PlayJob),
+    /// Decode-and-cache-only, no voice produced. Used to warm the decode
+    /// cache for a tab's sounds in the background (on startup and on tab
+    /// switch) so the *first* click on a button is as fast as every
+    /// click after it, instead of paying full decode+resample+ffmpeg-
+    /// fallback cost on that first click.
+    Prewarm(PathBuf),
 }
 
 struct Voice {
@@ -57,7 +71,7 @@ fn fingerprint(path: &Path) -> CacheKey {
 /// queued up decoding -- this is what makes the global Space-bar stop
 /// reliable no matter how many buttons were just mashed.
 pub struct AudioEngine {
-    job_tx: Sender<PlayJob>,
+    job_tx: Sender<EngineJob>,
     voices: Arc<Mutex<Vec<Voice>>>,
     master_gain: Arc<Mutex<f32>>,
     stream: cpal::Stream,
@@ -81,7 +95,7 @@ impl AudioEngine {
             .context("building output stream")?;
         stream.play().context("starting output stream")?;
 
-        let (job_tx, job_rx): (Sender<PlayJob>, Receiver<PlayJob>) = unbounded();
+        let (job_tx, job_rx): (Sender<EngineJob>, Receiver<EngineJob>) = unbounded();
 
         for _ in 0..WORKER_COUNT {
             let job_rx = job_rx.clone();
@@ -95,8 +109,20 @@ impl AudioEngine {
     /// Enqueues a play job. Never blocks the caller (UI thread) on decode
     /// work -- the actual decoding happens on the worker pool.
     pub fn play(&self, job: PlayJob) {
-        if self.job_tx.send(job).is_err() {
+        if self.job_tx.send(EngineJob::Play(job)).is_err() {
             log::error!("audio worker pool is gone; dropping play request");
+        }
+    }
+
+    /// Queues background decode-and-cache for every path (skips ones
+    /// already fresh in cache almost instantly). Call this whenever the
+    /// visible tab changes so its buttons are warm by the time the user
+    /// actually clicks one.
+    pub fn prewarm(&self, paths: impl IntoIterator<Item = PathBuf>) {
+        for path in paths {
+            if self.job_tx.send(EngineJob::Prewarm(path)).is_err() {
+                break;
+            }
         }
     }
 
@@ -128,49 +154,90 @@ impl AudioEngine {
     }
 }
 
-fn decode_worker(job_rx: Receiver<PlayJob>, voices: Arc<Mutex<Vec<Voice>>>) {
-    let mut cache: LruCache<CacheKey, Arc<Decoded>> =
-        LruCache::new(NonZeroUsize::new(DECODE_CACHE_CAPACITY).unwrap());
+struct DecodeCache {
+    items: LruCache<CacheKey, Arc<Decoded>>,
+    bytes: usize,
+}
+
+impl DecodeCache {
+    fn new() -> Self {
+        Self { items: LruCache::unbounded(), bytes: 0 }
+    }
+
+    fn get(&mut self, key: &CacheKey) -> Option<Arc<Decoded>> {
+        self.items.get(key).cloned()
+    }
+
+    fn put(&mut self, key: CacheKey, decoded: Decoded) -> Arc<Decoded> {
+        let size = decoded.byte_size();
+        let arc = Arc::new(decoded);
+        self.bytes += size;
+        if let Some(evicted) = self.items.put(key, arc.clone()) {
+            self.bytes = self.bytes.saturating_sub(evicted.byte_size());
+        }
+        while self.bytes > DECODE_CACHE_MAX_BYTES {
+            match self.items.pop_lru() {
+                Some((_, v)) => self.bytes = self.bytes.saturating_sub(v.byte_size()),
+                None => break,
+            }
+        }
+        arc
+    }
+}
+
+/// Decodes (using the shared cache) or returns the cached result. Shared
+/// by both play jobs and prewarm jobs so a prewarm followed by an actual
+/// click never decodes twice.
+fn decode_cached(cache: &mut DecodeCache, path: &Path) -> Option<Arc<Decoded>> {
+    let key = fingerprint(path);
+    if let Some(hit) = cache.get(&key) {
+        return Some(hit);
+    }
+    match decode::decode_file(path) {
+        Ok(d) => Some(cache.put(key, d)),
+        Err(e) => {
+            log::error!("failed to decode {}: {e}", path.display());
+            None
+        }
+    }
+}
+
+fn decode_worker(job_rx: Receiver<EngineJob>, voices: Arc<Mutex<Vec<Voice>>>) {
+    let mut cache = DecodeCache::new();
 
     while let Ok(job) = job_rx.recv() {
-        if !job.path.exists() {
-            log::warn!("play requested for missing file: {}", job.path.display());
-            continue;
-        }
-
-        let key = fingerprint(&job.path);
-        let decoded = if let Some(hit) = cache.get(&key) {
-            hit.clone()
-        } else {
-            match decode::decode_file(&job.path) {
-                Ok(d) => {
-                    let arc = Arc::new(d);
-                    cache.put(key, arc.clone());
-                    arc
-                }
-                Err(e) => {
-                    log::error!("failed to decode {}: {e}", job.path.display());
-                    continue;
+        match job {
+            EngineJob::Prewarm(path) => {
+                if path.exists() {
+                    decode_cached(&mut cache, &path);
                 }
             }
-        };
+            EngineJob::Play(job) => {
+                if !job.path.exists() {
+                    log::warn!("play requested for missing file: {}", job.path.display());
+                    continue;
+                }
 
-        let (left, right) = if job.pitch_semitones.abs() > 0.01 {
-            pitch::shift_stereo(&decoded.left, &decoded.right, job.pitch_semitones, decode::TARGET_SR as f32)
-        } else {
-            (decoded.left.clone(), decoded.right.clone())
-        };
+                let Some(decoded) = decode_cached(&mut cache, &job.path) else { continue };
 
-        let volume = job.volume.clamp(0.0, 2.0);
-        let left: Vec<f32> = left.iter().map(|s| s * volume).collect();
-        let right: Vec<f32> = right.iter().map(|s| s * volume).collect();
+                let (left, right) = if job.pitch_semitones.abs() > 0.01 {
+                    pitch::shift_stereo(&decoded.left, &decoded.right, job.pitch_semitones, decode::TARGET_SR as f32)
+                } else {
+                    (decoded.left.clone(), decoded.right.clone())
+                };
 
-        if left.is_empty() {
-            continue;
+                let volume = job.volume.clamp(0.0, 2.0);
+                let left: Vec<f32> = left.iter().map(|s| s * volume).collect();
+                let right: Vec<f32> = right.iter().map(|s| s * volume).collect();
+
+                if left.is_empty() {
+                    continue;
+                }
+
+                let source = job.path.to_string_lossy().to_string();
+                voices.lock().unwrap().push(Voice { left, right, pos: 0, source });
+            }
         }
-
-        let source = job.path.to_string_lossy().to_string();
-        voices.lock().unwrap().push(Voice { left, right, pos: 0, source });
     }
 }
 

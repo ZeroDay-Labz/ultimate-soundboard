@@ -48,14 +48,29 @@ pub fn show(ui: &mut Ui, tab: &mut TabModel, playing: &HashSet<String>) -> Board
             result.changed = true;
         }
 
+        // Gap only affects the grid layout's cell padding. Once Edit mode
+        // has been used once, a tab is permanently in free-form
+        // (absolute) layout -- like `soundboard_tab.py`, this is
+        // intentional (so a later grid relayout can never wipe out
+        // manually placed buttons), but it means Gap doing nothing here
+        // isn't a bug, just a control that no longer applies. Disabling
+        // it (rather than leaving it live but inert) makes that visible
+        // instead of feeling broken.
+        let grid_applies = tab.layout_mode == LayoutMode::Grid;
         ui.add_space(8.0);
         ui.label("Gap");
-        if ui.add(Slider::new(&mut tab.grid_spacing, 0..=40)).changed() {
+        let gap_resp = ui.add_enabled(grid_applies, Slider::new(&mut tab.grid_spacing, 0..=40));
+        if gap_resp.changed() {
             result.changed = true;
+        }
+        if !grid_applies {
+            gap_resp.on_disabled_hover_text(
+                "Only applies to grid layout. This tab switched to free-form positioning when Edit mode was first turned on.",
+            );
         }
 
         ui.add_space(8.0);
-        ui.label("Snap");
+        ui.label("Snap").on_hover_text("Snaps button position while dragging in Edit mode.");
         if ui.add(Slider::new(&mut tab.snap_size, 0..=64)).changed() {
             result.changed = true;
         }

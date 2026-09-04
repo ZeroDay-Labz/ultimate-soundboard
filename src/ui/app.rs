@@ -54,6 +54,13 @@ pub struct SoundboardApp {
     clone_url: String,
     clone_job: Option<CloneJob>,
     swf_job: Option<mpsc::Receiver<Result<SwfRipResult, String>>>,
+    /// Which tab's sounds were last sent to the decode cache for
+    /// background pre-warming (see `AudioEngine::prewarm`). Re-checked
+    /// every frame against the current tab so switching tabs (or editing
+    /// the current one) queues a fresh warm-up without repeating it
+    /// every single frame.
+    prewarmed_tab: Option<uuid::Uuid>,
+    prewarmed_button_count: usize,
 }
 
 impl SoundboardApp {
@@ -92,6 +99,8 @@ impl SoundboardApp {
             clone_url: String::new(),
             clone_job: None,
             swf_job: None,
+            prewarmed_tab: None,
+            prewarmed_button_count: 0,
         };
         app.resync_button_hotkeys();
         app.apply_master_gain();
@@ -274,6 +283,29 @@ impl SoundboardApp {
         if let Some(engine) = &self.engine {
             let gain = if self.state.muted { 0.0 } else { self.state.master_volume };
             engine.set_master_gain(gain);
+        }
+    }
+
+    /// Sends the current tab's button files to the decode cache in the
+    /// background whenever the visible tab changes (or gains/loses
+    /// buttons), so clicking a button is a cache hit instead of a cold
+    /// decode. Cheap to call every frame -- it's a no-op unless something
+    /// actually changed.
+    fn prewarm_current_tab(&mut self) {
+        let Some(tab) = self.state.tabs.get(self.state.current_tab) else { return };
+        if self.prewarmed_tab == Some(tab.id) && self.prewarmed_button_count == tab.buttons.len() {
+            return;
+        }
+        self.prewarmed_tab = Some(tab.id);
+        self.prewarmed_button_count = tab.buttons.len();
+
+        if let Some(engine) = &self.engine {
+            let paths = tab
+                .buttons
+                .iter()
+                .filter(|b| !b.missing_file && !b.file.is_empty())
+                .map(|b| PathBuf::from(&b.file));
+            engine.prewarm(paths);
         }
     }
 
@@ -716,6 +748,8 @@ impl eframe::App for SoundboardApp {
         if !playing.is_empty() {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
+
+        self.prewarm_current_tab();
 
         egui::CentralPanel::default().show(ui, |ui| {
             if let Some((_, tex)) = &self.wallpaper_texture {

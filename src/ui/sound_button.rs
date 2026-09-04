@@ -138,13 +138,25 @@ pub fn show(ui: &mut Ui, rect: Rect, model: &mut ButtonModel, edit_mode: bool, i
         response.clone().on_hover_text(model.label.clone());
     }
 
-    show_context_menu(&response, id, model, &mut result);
+    show_context_menu(&response, edit_mode, id, model, &mut result);
 
     result
 }
 
-fn show_context_menu(response: &egui::Response, id: Id, model: &mut ButtonModel, result: &mut SoundButtonResult) {
-    response.context_menu(|ui| {
+/// Right-click always opens this (rename/color/emoji/image/volume/pitch/
+/// hotkey/delete); in Edit mode a plain click (that isn't a drag) also
+/// opens it, since a click there can't mean "play" and would otherwise do
+/// nothing -- discoverability matters more than a convention here, most
+/// people won't think to right-click a tile they're already editing.
+fn show_context_menu(response: &egui::Response, edit_mode: bool, id: Id, model: &mut ButtonModel, result: &mut SoundButtonResult) {
+    let should_open = response.secondary_clicked() || (edit_mode && response.clicked() && !response.dragged());
+
+    egui::Popup::from_response(response)
+        .kind(egui::PopupKind::Menu)
+        .layout(egui::Layout::top_down_justified(egui::Align::Min))
+        .at_pointer_fixed()
+        .open_memory(should_open.then_some(egui::SetOpenCommand::Bool(true)))
+        .show(|ui| {
         ui.set_min_width(220.0);
 
         ui.label("Rename");
