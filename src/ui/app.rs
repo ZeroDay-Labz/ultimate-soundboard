@@ -530,6 +530,22 @@ impl SoundboardApp {
         }
     }
 
+    /// File-picker alternative to drag-and-drop, added because drag-out
+    /// from some apps (Electron-based chat clients in particular) doesn't
+    /// reliably hand over a real OS file path to drop targets -- this
+    /// path goes through a native "Open File" dialog instead, which is
+    /// unaffected by that. Adds to the current tab, same as dropping.
+    fn add_sound_files_dialog(&mut self) {
+        let files = rfd::FileDialog::new().add_filter("Audio", util::AUDIO_EXTENSIONS).pick_files();
+        if let Some(files) = files {
+            let count = files.len();
+            self.add_files_to_current_tab(files);
+            if count > 0 {
+                self.toasts.success(format!("Added {count} sound{}", if count == 1 { "" } else { "s" }));
+            }
+        }
+    }
+
     fn handle_drops(&mut self, ctx: &egui::Context) {
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         if dropped.is_empty() {
@@ -593,6 +609,9 @@ impl SoundboardApp {
             ui.horizontal(|ui| {
                 if ui.button("➕ New Tab").clicked() {
                     self.new_tab(None);
+                }
+                if ui.button("🎵 Add Sound").on_hover_text("Add audio file(s) to the current tab (works when drag-and-drop doesn't -- e.g. dragging out of Discord's own window isn't reliable)").clicked() {
+                    self.add_sound_files_dialog();
                 }
                 ui.separator();
                 if ui.button("📂 Import").on_hover_text("Import a soundboard .zip").clicked() {
