@@ -46,14 +46,22 @@ pub fn resample_stereo(
         pos += chunk_size;
     }
 
-    // Flush the remaining tail (shorter than one chunk) plus any samples
-    // still buffered inside the resampler.
+    // Flush the remaining tail (shorter than one chunk), if there is one.
+    // When `in_len` is an exact multiple of `chunk_size`, `pos == in_len`
+    // and this slice is empty -- passing an empty (as opposed to `None`)
+    // partial input to rubato is a real, reproducible failure ("Insufficient
+    // buffer size 0 for input channel 0, expected 1024"), which used to
+    // make resampling silently bail out to un-resampled audio (wrong
+    // pitch/speed) for any file whose frame count happened to land on
+    // that boundary -- common enough with 44.1kHz sources to matter.
     let tail_left = &left[pos..];
     let tail_right = &right[pos..];
-    let tail_input = [tail_left, tail_right];
-    let out = resampler.process_partial(Some(&tail_input), None)?;
-    out_left.extend_from_slice(&out[0]);
-    out_right.extend_from_slice(&out[1]);
+    if !tail_left.is_empty() {
+        let tail_input = [tail_left, tail_right];
+        let out = resampler.process_partial(Some(&tail_input), None)?;
+        out_left.extend_from_slice(&out[0]);
+        out_right.extend_from_slice(&out[1]);
+    }
 
     // One more flush call with no input to drain internal delay.
     let flush = resampler.process_partial::<Vec<f32>>(None, None)?;
