@@ -16,9 +16,12 @@ pub struct ImportResult {
 }
 
 /// Called with a human-readable progress line as the importer works.
-pub type ProgressFn<'a> = dyn Fn(&str) + 'a;
-/// Polled periodically; return `false` to cancel the import ASAP.
-pub type RunningFn<'a> = dyn Fn() -> bool + 'a;
+/// `Sync` because importers may call it from a pool of worker threads
+/// downloading concurrently (see `realm_of_darkness.rs`).
+pub type ProgressFn<'a> = dyn Fn(&str) + Sync + 'a;
+/// Polled periodically; return `false` to cancel the import ASAP. `Sync`
+/// for the same reason as `ProgressFn`.
+pub type RunningFn<'a> = dyn Fn() -> bool + Sync + 'a;
 
 /// An importer that can turn some external source (a URL, typically) into
 /// a set of downloaded sound files. Importers are stateless and must not

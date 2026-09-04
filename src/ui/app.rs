@@ -25,7 +25,7 @@ enum CloneMsg {
 }
 
 struct CloneJob {
-    rx: mpsc::Receiver<CloneMsg>,
+    rx: crossbeam_channel::Receiver<CloneMsg>,
     running: Arc<AtomicBool>,
     log: Vec<String>,
 }
@@ -113,12 +113,15 @@ impl SoundboardApp {
             return;
         }
 
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = crossbeam_channel::unbounded();
         let running = Arc::new(AtomicBool::new(true));
         let running_bg = running.clone();
 
         std::thread::spawn(move || {
             let tx_progress = tx.clone();
+            // Sync (unlike std::sync::mpsc::Sender) so importers can call
+            // this concurrently from a worker-thread pool -- see
+            // `realm_of_darkness.rs`'s parallel downloads.
             let progress = move |msg: &str| {
                 let _ = tx_progress.send(CloneMsg::Progress(msg.to_string()));
             };
@@ -307,6 +310,37 @@ impl SoundboardApp {
                 .map(|b| PathBuf::from(&b.file));
             engine.prewarm(paths);
         }
+    }
+
+    /// Visual "drop here" feedback while something is being dragged over
+    /// the window. Doubles as a diagnostic: if a file being dragged in
+    /// from elsewhere never makes this overlay appear, the OS/toolkit
+    /// never told egui about the drag at all (nothing this app's code can
+    /// fix -- most likely the source app not offering a real file via
+    /// native drag-and-drop, e.g. some Electron apps on Linux). If the
+    /// overlay does appear but nothing happens on release, that's a
+    /// narrower, fixable bug in `handle_drops`.
+    fn show_drag_hover_overlay(&self, ctx: &egui::Context) {
+        let count = ctx.input(|i| i.raw.hovered_files.len());
+        if count == 0 {
+            return;
+        }
+        egui::Area::new(egui::Id::new("drag_hover_overlay"))
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 12.0))
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(super::theme::palette::LAVENDER.gamma_multiply(0.9))
+                    .corner_radius(8.0)
+                    .inner_margin(egui::Margin::symmetric(14, 8))
+                    .show(ui, |ui| {
+                        ui.colored_label(
+                            super::theme::palette::CRUST,
+                            format!("Drop {count} file{} to add", if count == 1 { "" } else { "s" }),
+                        );
+                    });
+            });
     }
 
     fn ensure_wallpaper_texture(&mut self, ctx: &egui::Context) {
@@ -750,6 +784,7 @@ impl eframe::App for SoundboardApp {
         }
 
         self.prewarm_current_tab();
+        self.show_drag_hover_overlay(&ctx);
 
         egui::CentralPanel::default().show(ui, |ui| {
             if let Some((_, tex)) = &self.wallpaper_texture {

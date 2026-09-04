@@ -11,6 +11,7 @@ use url::Url;
 
 use super::{downloads_root, ImportResult, ImportedButton, Importer, ProgressFn, RunningFn};
 
+
 const DOMAIN: &str = "realmofdarkness.net/sb/";
 const SITE_ROOT: &str = "https://www.realmofdarkness.net";
 const USER_AGENT: &str = "Mozilla/5.0";
@@ -64,35 +65,17 @@ impl Importer for RealmOfDarknessImporter {
         let base_dir = downloads_root().join(&slug);
         fs::create_dir_all(&base_dir)?;
 
-        let mut buttons = Vec::new();
-        for (sid, label) in &button_items {
-            if !running() {
-                break;
-            }
-
-            let candidates = build_candidates(sid, &thumb_ids, &thumb_set, prefers_dash_a);
-            let mut saved: Option<String> = None;
-
-            for fname in candidates {
-                if !running() {
-                    break;
-                }
-                let mp3_url = format!("{audio_base}{fname}.mp3");
-                progress(&format!("Downloading: {label} ({fname}.mp3)"));
-                match download(&client, &mp3_url, &base_dir, running) {
-                    Ok(path) => {
-                        saved = Some(path);
-                        break;
-                    }
-                    Err(_) => continue,
-                }
-            }
-
-            if let Some(path) = saved {
-                progress(&format!("Downloaded: {label}"));
-                buttons.push(ImportedButton { label: label.clone(), file: path });
-            }
-        }
+        let buttons = download_all_buttons(
+            &client,
+            &button_items,
+            &thumb_ids,
+            &thumb_set,
+            prefers_dash_a,
+            &audio_base,
+            &base_dir,
+            progress,
+            running,
+        );
 
         if buttons.is_empty() {
             return Err(anyhow!("No audio files were successfully imported"));
@@ -100,6 +83,83 @@ impl Importer for RealmOfDarknessImporter {
 
         Ok(ImportResult { tab_name, buttons })
     }
+}
+
+/// How many buttons to resolve+download at once. Bounded concurrency --
+/// effectively a semaphore with this many permits, implemented as a fixed
+/// pool of worker threads pulling from a shared job queue (`crossbeam_channel`
+/// gives that for free: N consumers racing `recv()` on the same receiver
+/// is exactly N concurrent permits, no separate semaphore type needed).
+/// High enough to meaningfully parallelize a 100+ button board, low
+/// enough to stay polite to the site instead of hammering it.
+const DOWNLOAD_CONCURRENCY: usize = 8;
+
+/// Resolves and downloads every button's audio file in parallel across a
+/// small worker pool, instead of one full request-probe-download cycle at
+/// a time. This is the dominant cost for a big board (confirmed against
+/// the real site: ~150 buttons took several minutes fully sequential),
+/// since each button can involve several candidate-filename probes before
+/// landing on the real one.
+#[allow(clippy::too_many_arguments)]
+fn download_all_buttons(
+    client: &reqwest::blocking::Client,
+    button_items: &[(String, String)],
+    thumb_ids: &[String],
+    thumb_set: &HashSet<String>,
+    prefers_dash_a: bool,
+    audio_base: &str,
+    base_dir: &Path,
+    progress: &ProgressFn,
+    running: &RunningFn,
+) -> Vec<ImportedButton> {
+    let (job_tx, job_rx) = crossbeam_channel::unbounded::<(String, String)>();
+    for item in button_items {
+        let _ = job_tx.send(item.clone());
+    }
+    drop(job_tx);
+
+    let (result_tx, result_rx) = crossbeam_channel::unbounded::<ImportedButton>();
+    let worker_count = DOWNLOAD_CONCURRENCY.min(button_items.len().max(1));
+
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let job_rx = job_rx.clone();
+            let result_tx = result_tx.clone();
+            scope.spawn(move || {
+                while let Ok((sid, label)) = job_rx.recv() {
+                    if !running() {
+                        continue;
+                    }
+
+                    let candidates = build_candidates(&sid, thumb_ids, thumb_set, prefers_dash_a);
+                    let mut saved: Option<String> = None;
+
+                    for fname in candidates {
+                        if !running() {
+                            break;
+                        }
+                        let mp3_url = format!("{audio_base}{fname}.mp3");
+                        progress(&format!("Downloading: {label} ({fname}.mp3)"));
+                        match download(client, &mp3_url, base_dir, running) {
+                            Ok(path) => {
+                                saved = Some(path);
+                                break;
+                            }
+                            Err(_) => continue,
+                        }
+                    }
+
+                    if let Some(path) = saved {
+                        progress(&format!("Downloaded: {label}"));
+                        let _ = result_tx.send(ImportedButton { label: label.clone(), file: path });
+                    }
+                }
+            });
+        }
+        drop(result_tx);
+    });
+
+    result_rx.into_iter().collect()
 }
 
 // -------------------------

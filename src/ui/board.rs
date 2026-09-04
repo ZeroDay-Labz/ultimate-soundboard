@@ -149,12 +149,25 @@ fn show_grid_layout(ui: &mut Ui, tab: &mut TabModel, playing: &HashSet<String>, 
         let y = origin.y + spacing + row as f32 * (size + spacing);
         let btn_rect = Rect::from_min_size(Pos2::new(x, y), Vec2::splat(size));
 
-        apply_button(ui, btn_rect, btn, false, tab.volume, tab.pitch, playing, result);
+        apply_button(ui, btn_rect, btn, false, 0, tab.volume, tab.pitch, playing, result);
     }
 }
 
 fn show_absolute_layout(ui: &mut Ui, tab: &mut TabModel, playing: &HashSet<String>, result: &mut BoardResult) {
     let avail = ui.available_size();
+    let edit_mode = tab.edit_mode;
+    let snap = tab.snap_size;
+
+    // Canvas size must be computed from *already-snapped* positions, or a
+    // snap that rounds a button outward can land it beyond the area this
+    // frame allocated for the board -- which is what "snapping pushes
+    // tiles off the screen" actually was: the allocation used stale,
+    // pre-snap bounds. Non-negative too, so nothing can snap to a
+    // negative coordinate and become unreachable off the top/left edge.
+    for btn in tab.buttons.iter_mut() {
+        clamp_button_position(btn);
+    }
+
     let max_x = tab
         .buttons
         .iter()
@@ -168,18 +181,13 @@ fn show_absolute_layout(ui: &mut Ui, tab: &mut TabModel, playing: &HashSet<Strin
 
     let (rect, _resp) = ui.allocate_exact_size(Vec2::new(max_x, max_y), Sense::hover());
     let origin = rect.min;
-    let edit_mode = tab.edit_mode;
-    let snap = tab.snap_size;
 
     for btn in tab.buttons.iter_mut() {
-        if edit_mode {
-            snap_button(btn, snap);
-        }
         let btn_rect = Rect::from_min_size(
             origin + Vec2::new(btn.x as f32, btn.y as f32),
             Vec2::new(btn.width as f32, btn.height as f32),
         );
-        apply_button(ui, btn_rect, btn, edit_mode, tab.volume, tab.pitch, playing, result);
+        apply_button(ui, btn_rect, btn, edit_mode, snap, tab.volume, tab.pitch, playing, result);
     }
 }
 
@@ -188,6 +196,7 @@ fn apply_button(
     rect: Rect,
     btn: &mut ButtonModel,
     edit_mode: bool,
+    snap: u32,
     tab_volume: f32,
     tab_pitch: f32,
     playing: &HashSet<String>,
@@ -201,7 +210,16 @@ fn apply_button(
             + crate::audio::pitch::ratio_to_semitones(tab_pitch);
         result.play = Some(PlayRequest { file: btn.file.clone(), volume, pitch_semitones: semitones });
     }
-    if r.geometry_changed || r.changed {
+    if r.geometry_changed {
+        // Snap on release, not every frame -- snapping continuously while
+        // dragging (the old behavior) fought the drag delta each frame
+        // and the button never actually landed on a grid line, which is
+        // what "snap doesn't actually snap" was.
+        snap_button(btn, snap);
+        clamp_button_position(btn);
+        result.changed = true;
+    }
+    if r.changed {
         result.changed = true;
     }
     if r.hotkey_changed {
@@ -219,6 +237,14 @@ fn snap_button(btn: &mut ButtonModel, snap: u32) {
     let snap = snap as i32;
     btn.x = ((btn.x as f32 / snap as f32).round() as i32) * snap;
     btn.y = ((btn.y as f32 / snap as f32).round() as i32) * snap;
+}
+
+/// Keeps a button's stored position non-negative so it can never end up
+/// unreachable off the top/left edge of the board (defensive -- rounding
+/// during snap should never produce this, but cheap to guarantee).
+fn clamp_button_position(btn: &mut ButtonModel) {
+    btn.x = btn.x.max(0);
+    btn.y = btn.y.max(0);
 }
 
 /// Freezes the current grid cell positions into `x`/`y` before switching a

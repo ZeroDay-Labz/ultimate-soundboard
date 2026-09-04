@@ -6,7 +6,11 @@ mod ui;
 mod util;
 
 fn main() -> eframe::Result {
-    env_logger::init();
+    // Default to info-level so the app's own diagnostic logging (decode
+    // failures, unrecognized drops, importer errors) is visible to a user
+    // just running the binary normally, without needing to know to set
+    // RUST_LOG themselves. RUST_LOG still overrides this if set.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
