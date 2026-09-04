@@ -38,7 +38,12 @@ finish-args:
 build-options:
   append-path: /usr/lib/sdk/rust-stable/bin
   env:
-    CARGO_HOME: /run/build/ultimate-soundboard/cargo-home
+    # Must match where cargo-sources.json's generated config/vendor
+    # entries actually land: relative "cargo/config" + "cargo/vendor/..."
+    # dest paths inside the module's build directory (which is
+    # /run/build/<module-name>/, i.e. this module's `sources:` -- the repo
+    # checkout plus the vendor tree -- all get merged into one root).
+    CARGO_HOME: /run/build/ultimate-soundboard/cargo
 
 modules:
   - name: ultimate-soundboard
