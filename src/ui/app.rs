@@ -17,7 +17,7 @@ use crate::model::{AppState, ButtonModel, TabModel};
 use crate::persistence;
 use crate::util;
 
-use super::{board, settings, tabs, toast};
+use super::{board, meter, settings, tabs, toast};
 
 enum CloneMsg {
     Progress(String),
@@ -61,11 +61,15 @@ pub struct SoundboardApp {
     /// every single frame.
     prewarmed_tab: Option<uuid::Uuid>,
     prewarmed_button_count: usize,
+    level_meter: meter::LevelMeter,
+    last_meter_update: Option<Instant>,
+    screenshot_frames: u32,
 }
 
 impl SoundboardApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         super::theme::apply(&cc.egui_ctx);
+        super::fonts::install(&cc.egui_ctx);
 
         let mut state = persistence::load_state();
         state.normalize();
@@ -101,6 +105,9 @@ impl SoundboardApp {
             swf_job: None,
             prewarmed_tab: None,
             prewarmed_button_count: 0,
+            level_meter: meter::LevelMeter::default(),
+            last_meter_update: None,
+            screenshot_frames: 0,
         };
         app.resync_button_hotkeys();
         app.apply_master_gain();
@@ -341,6 +348,45 @@ impl SoundboardApp {
                         );
                     });
             });
+    }
+
+    /// Dev/QA affordance: with `ULTIMATE_SOUNDBOARD_SCREENSHOT=<path>`
+    /// set, the app captures its own framebuffer a few frames in and
+    /// writes it out, then exits. Worth having as a real feature rather
+    /// than a throwaway: egui screenshotting itself works on any
+    /// compositor, whereas external X11 grabbers capture pure black for
+    /// anything composited by Wayland, which makes "does this actually
+    /// look right" otherwise unanswerable on a modern Linux desktop.
+    fn handle_screenshot_hook(&mut self, ctx: &egui::Context) {
+        let Ok(path) = std::env::var("ULTIMATE_SOUNDBOARD_SCREENSHOT") else { return };
+
+        self.screenshot_frames += 1;
+        ctx.request_repaint();
+
+        // Give layout, fonts and the first prewarm a moment to settle.
+        if self.screenshot_frames == 30 {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+        }
+
+        let shot = ctx.input(|i| {
+            i.events.iter().find_map(|e| match e {
+                egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                _ => None,
+            })
+        });
+
+        if let Some(image) = shot {
+            let [w, h] = image.size;
+            let pixels: Vec<u8> = image.pixels.iter().flat_map(|p| p.to_array()).collect();
+            match image::RgbaImage::from_raw(w as u32, h as u32, pixels) {
+                Some(buf) => match buf.save(&path) {
+                    Ok(()) => log::info!("wrote screenshot to {path} ({w}x{h})"),
+                    Err(e) => log::error!("could not write screenshot to {path}: {e}"),
+                },
+                None => log::error!("screenshot buffer had unexpected size"),
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
     }
 
     fn ensure_wallpaper_texture(&mut self, ctx: &egui::Context) {
@@ -695,31 +741,50 @@ impl SoundboardApp {
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Keep status compact: a long sentence here competes
+                    // with the master strip for width and the two end up
+                    // drawn on top of each other on narrower windows.
                     if let Some(err) = &self.engine_error {
-                        ui.label(RichText::new(format!("Audio unavailable: {err}")).color(super::theme::palette::RED));
+                        ui.label(RichText::new("⚠ audio").color(super::theme::palette::RED))
+                            .on_hover_text(format!("Audio unavailable: {err}"));
                     } else if !self.space_hotkey_is_global {
-                        ui.label(
-                            RichText::new("Space stops sounds only while this window is focused (no system-wide hotkey support here)")
-                                .color(super::theme::palette::SUBTEXT)
-                                .small(),
-                        );
+                        ui.label(RichText::new("⚠ hotkeys").color(super::theme::palette::YELLOW).small())
+                            .on_hover_text(
+                                "System-wide hotkeys aren't available on this session, so Space (stop all) and per-button hotkeys only fire while this window is focused.",
+                            );
                     }
 
                     ui.add_space(8.0);
+
+                    // Master strip, laid out right-to-left: meter, then
+                    // fader, then mute -- reads like the master section on
+                    // a mixer once you get to the right edge of the bar.
+                    self.level_meter.show(ui, egui::vec2(110.0, 12.0));
+                    ui.add_space(6.0);
+
                     let mute_icon = if self.state.muted { "🔇" } else { "🔊" };
-                    if ui.button(mute_icon).on_hover_text("Mute / unmute").clicked() {
+                    let mute_text = if self.state.muted {
+                        RichText::new(mute_icon).color(super::theme::palette::RED)
+                    } else {
+                        RichText::new(mute_icon)
+                    };
+                    if ui.button(mute_text).on_hover_text("Mute / unmute").clicked() {
                         self.state.muted = !self.state.muted;
                         self.apply_master_gain();
                         self.mark_dirty();
                     }
                     let mut volume = self.state.master_volume;
                     let slider = egui::Slider::new(&mut volume, 0.0..=2.0).show_value(false);
-                    if ui.add_sized([90.0, 18.0], slider).changed() {
+                    if ui
+                        .add_sized([90.0, 18.0], slider)
+                        .on_hover_text(format!("Master volume: {:.0}%", self.state.master_volume * 100.0))
+                        .changed()
+                    {
                         self.state.master_volume = volume;
                         self.apply_master_gain();
                         self.mark_dirty();
                     }
-                    ui.label(RichText::new("Master").color(super::theme::palette::SUBTEXT).small());
+                    ui.label(RichText::new("MASTER").color(super::theme::palette::SUBTEXT).small().monospace());
                 });
             });
 
@@ -733,6 +798,8 @@ impl SoundboardApp {
 impl eframe::App for SoundboardApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+
+        self.handle_screenshot_hook(&ctx);
 
         while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
             if event.state != HotKeyState::Pressed {
@@ -778,9 +845,19 @@ impl eframe::App for SoundboardApp {
 
         let mut hotkeys_changed = false;
 
-        let playing = self.engine.as_ref().map(|e| e.playing_paths()).unwrap_or_default();
-        if !playing.is_empty() {
-            ctx.request_repaint_after(Duration::from_millis(50));
+        let playing = self.engine.as_ref().map(|e| e.playing_progress()).unwrap_or_default();
+
+        // Feed the meters with real elapsed time so their fall-off is
+        // frame-rate independent, and keep repainting while either a sound
+        // is playing or the meters are still settling back to silence.
+        let now = Instant::now();
+        let dt = self.last_meter_update.map(|t| now.duration_since(t).as_secs_f32()).unwrap_or(1.0 / 60.0);
+        self.last_meter_update = Some(now);
+        let peaks = self.engine.as_ref().map(|e| e.peak_levels()).unwrap_or((0.0, 0.0));
+        self.level_meter.update(peaks, dt);
+
+        if !playing.is_empty() || self.level_meter.is_active() {
+            ctx.request_repaint_after(Duration::from_millis(33));
         }
 
         self.prewarm_current_tab();

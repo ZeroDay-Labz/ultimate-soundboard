@@ -1,7 +1,11 @@
 pub mod app;
 pub mod board;
 pub mod color;
+pub mod emoji;
 pub mod emoji_picker;
+pub mod fonts;
+pub mod image_cache;
+pub mod meter;
 pub mod settings;
 pub mod sound_button;
 pub mod tabs;

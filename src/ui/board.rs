@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use egui::{FontId, Pos2, Rect, RichText, ScrollArea, Sense, Slider, Ui, Vec2};
 
@@ -27,7 +27,7 @@ pub struct BoardResult {
 /// rules in `soundboard_tab.py`: grid auto-layout by default, switching
 /// permanently to absolute positioning the moment edit mode is turned on
 /// (so a later grid relayout never wipes out manually placed buttons).
-pub fn show(ui: &mut Ui, tab: &mut TabModel, playing: &HashSet<String>) -> BoardResult {
+pub fn show(ui: &mut Ui, tab: &mut TabModel, playing: &HashMap<String, f32>) -> BoardResult {
     let mut result = BoardResult::default();
 
     ui.horizontal(|ui| {
@@ -45,17 +45,29 @@ pub fn show(ui: &mut Ui, tab: &mut TabModel, playing: &HashSet<String>) -> Board
         ui.add_space(8.0);
         ui.label("Size");
         if ui.add(Slider::new(&mut tab.button_size, 48..=200)).changed() {
+            // Grid layout derives every button's size from `tab.button_size`
+            // directly, but free-form layout draws each button from its own
+            // `width`/`height`. So without this the Size slider silently
+            // stopped doing anything the moment a tab left grid layout --
+            // which is exactly what "once size is adjusted it's stuck at
+            // whatever it's set to" was. Size is a tab-wide control, so it
+            // overrides any per-button resizing done by hand in Edit mode.
+            let size = tab.button_size;
+            for btn in tab.buttons.iter_mut() {
+                btn.width = size;
+                btn.height = size;
+            }
             result.changed = true;
         }
 
-        // Gap only affects the grid layout's cell padding. Once Edit mode
-        // has been used once, a tab is permanently in free-form
-        // (absolute) layout -- like `soundboard_tab.py`, this is
-        // intentional (so a later grid relayout can never wipe out
-        // manually placed buttons), but it means Gap doing nothing here
-        // isn't a bug, just a control that no longer applies. Disabling
-        // it (rather than leaving it live but inert) makes that visible
-        // instead of feeling broken.
+        // Gap only affects the grid layout's cell padding. Turning on Edit
+        // mode converts a tab to free-form (absolute) positioning, which
+        // is deliberate -- it's what stops a later grid relayout from
+        // wiping out hand-placed buttons, same as `soundboard_tab.py`.
+        // What made that feel broken was that the conversion used to be
+        // one-way and permanent: Gap went dead forever with no way back
+        // and no way to tell why. It's still a conversion, but now it's
+        // reversible via the Re-flow button below.
         let grid_applies = tab.layout_mode == LayoutMode::Grid;
         ui.add_space(8.0);
         ui.label("Gap");
@@ -65,8 +77,22 @@ pub fn show(ui: &mut Ui, tab: &mut TabModel, playing: &HashSet<String>) -> Board
         }
         if !grid_applies {
             gap_resp.on_disabled_hover_text(
-                "Only applies to grid layout. This tab switched to free-form positioning when Edit mode was first turned on.",
+                "Only applies to grid layout. This tab switched to free-form positioning when Edit mode was turned on -- use Re-flow to go back.",
             );
+            if ui
+                .button("Re-flow")
+                .on_hover_text(
+                    "Put every button back into an auto-arranged grid and re-enable Gap. \
+                     Hand-placed positions are kept, so turning Edit mode on again restores them.",
+                )
+                .clicked()
+            {
+                tab.layout_mode = LayoutMode::Grid;
+                tab.edit_mode = false;
+                result.changed = true;
+            }
+        } else if grid_applies && tab.edit_mode {
+            gap_resp.on_hover_text("Applies once Edit mode is turned off.");
         }
 
         ui.add_space(8.0);
@@ -129,7 +155,7 @@ fn show_empty_state(ui: &mut Ui) {
     });
 }
 
-fn show_grid_layout(ui: &mut Ui, tab: &mut TabModel, playing: &HashSet<String>, result: &mut BoardResult) {
+fn show_grid_layout(ui: &mut Ui, tab: &mut TabModel, playing: &HashMap<String, f32>, result: &mut BoardResult) {
     let size = tab.button_size as f32;
     let spacing = tab.grid_spacing as f32;
     let avail_width = ui.available_width().max(size);
@@ -153,7 +179,7 @@ fn show_grid_layout(ui: &mut Ui, tab: &mut TabModel, playing: &HashSet<String>, 
     }
 }
 
-fn show_absolute_layout(ui: &mut Ui, tab: &mut TabModel, playing: &HashSet<String>, result: &mut BoardResult) {
+fn show_absolute_layout(ui: &mut Ui, tab: &mut TabModel, playing: &HashMap<String, f32>, result: &mut BoardResult) {
     let avail = ui.available_size();
     let edit_mode = tab.edit_mode;
     let snap = tab.snap_size;
@@ -199,11 +225,11 @@ fn apply_button(
     snap: u32,
     tab_volume: f32,
     tab_pitch: f32,
-    playing: &HashSet<String>,
+    playing: &HashMap<String, f32>,
     result: &mut BoardResult,
 ) {
-    let is_playing = !btn.file.is_empty() && playing.contains(&btn.file);
-    let r = sound_button::show(ui, rect, btn, edit_mode, is_playing);
+    let progress = if btn.file.is_empty() { None } else { playing.get(&btn.file).copied() };
+    let r = sound_button::show(ui, rect, btn, edit_mode, progress);
     if r.play {
         let volume = (btn.volume * tab_volume).clamp(0.0, 2.0);
         let semitones = crate::audio::pitch::ratio_to_semitones(btn.pitch)

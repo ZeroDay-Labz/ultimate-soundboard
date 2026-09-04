@@ -24,6 +24,24 @@ pub mod palette {
     pub const GREEN: Color32 = Color32::from_rgb(0xa6, 0xe3, 0xa1);
     pub const YELLOW: Color32 = Color32::from_rgb(0xf9, 0xe2, 0xaf);
     pub const RED: Color32 = Color32::from_rgb(0xf3, 0x8b, 0xa8);
+
+    /// One-click fills for the tile color picker. Deliberately dark and
+    /// muted rather than the bright accent hues above: these are used as
+    /// full-tile backgrounds behind light label text, so they need to sit
+    /// well below the text in luminance to stay readable at a glance on a
+    /// wall of buttons.
+    pub const TILE_PRESETS: &[Color32] = &[
+        SURFACE0,
+        Color32::from_rgb(0x45, 0x47, 0x5a), // slate
+        Color32::from_rgb(0x5c, 0x2b, 0x35), // red
+        Color32::from_rgb(0x5e, 0x3a, 0x22), // peach
+        Color32::from_rgb(0x5c, 0x4d, 0x22), // amber
+        Color32::from_rgb(0x2c, 0x4a, 0x2e), // green
+        Color32::from_rgb(0x1f, 0x4a, 0x47), // teal
+        Color32::from_rgb(0x24, 0x3c, 0x5e), // blue
+        Color32::from_rgb(0x44, 0x2f, 0x5e), // violet
+        Color32::from_rgb(0x5c, 0x2f, 0x4c), // magenta
+    ];
 }
 
 use palette::*;

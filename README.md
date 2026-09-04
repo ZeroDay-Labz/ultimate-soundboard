@@ -111,3 +111,28 @@ cargo test -- --ignored --nocapture realm_of_darkness  # live network test
 
 The live-network test isn't run in CI (it hits the real
 realmofdarkness.net); run it manually if you touch the scraper.
+
+## Emoji rendering
+
+egui's text rasterizer has no color-glyph support, so no font can give us
+colored emoji: the COLRv1 fonts shipped by Linux and Windows can't be
+rasterized by it at all. Emoji are therefore drawn as **images**, not
+text.
+
+`assets/emoji/atlas.png` is a sprite atlas of the curated picker set,
+pre-rendered offline by `tools/gen_emoji_atlas.py` (Pango/cairo, which do
+understand COLRv1). Regenerate it whenever `EMOJIS` in
+`src/ui/emoji_picker.rs` changes:
+
+```sh
+python3 tools/gen_emoji_atlas.py   # needs python3-gobject, python3-cairo,
+                                   # and Noto Color Emoji installed
+```
+
+Emoji outside that set -- typed into a label, or arriving with a scraped
+board -- fall back to `assets/fonts/NotoEmoji-Regular.ttf`, a monochrome
+outline build bundled under the SIL Open Font License 1.1 (full text in
+`assets/fonts/NotoEmoji-OFL.txt`). Without that fallback they'd render as
+empty tofu boxes, since egui's default fonts cover only a handful of
+emoji. Both assets are compiled into the binary, so every platform
+renders identically with no system font dependency.

@@ -1,12 +1,12 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, StreamTrait};
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{select, unbounded, Receiver, Sender, TryRecvError};
 use lru::LruCache;
 
 use super::decode::{self, Decoded};
@@ -30,15 +30,15 @@ pub struct PlayJob {
     pub pitch_semitones: f32,
 }
 
-enum EngineJob {
-    Play(PlayJob),
-    /// Decode-and-cache-only, no voice produced. Used to warm the decode
-    /// cache for a tab's sounds in the background (on startup and on tab
-    /// switch) so the *first* click on a button is as fast as every
-    /// click after it, instead of paying full decode+resample+ffmpeg-
-    /// fallback cost on that first click.
-    Prewarm(PathBuf),
-}
+// Play and prewarm ride on *separate* channels rather than one job enum,
+// because they have opposite urgency and prewarm massively outnumbers
+// play. Switching to a tab queues one prewarm per button -- 157 of them
+// for a scraped board -- and with a single FIFO queue the click that
+// follows lands behind every one of those decodes. That was the "after
+// switching tabs it takes a really long time to play a sound" bug: not
+// slow decoding, just a click waiting its turn behind a whole tab's
+// worth of background work. Two channels let the workers always serve a
+// click first (see `decode_worker`).
 
 struct Voice {
     left: Vec<f32>,
@@ -66,14 +66,47 @@ fn fingerprint(path: &Path) -> CacheKey {
     }
 }
 
+/// Peak level of the mixed output, written by the audio callback and
+/// drained by the UI's level meters. Lock-free on purpose: the callback
+/// runs on a realtime-priority thread where blocking on a mutex risks
+/// audible dropouts. Only one thread writes, only the UI reads-and-resets,
+/// so a plain load/compare/store (rather than a CAS loop) is fine -- the
+/// worst a lost race can do is drop one frame's worth of meter movement.
+#[derive(Default)]
+pub struct PeakMeter {
+    left: AtomicU32,
+    right: AtomicU32,
+}
+
+impl PeakMeter {
+    fn report(&self, l: f32, r: f32) {
+        if l > f32::from_bits(self.left.load(Ordering::Relaxed)) {
+            self.left.store(l.to_bits(), Ordering::Relaxed);
+        }
+        if r > f32::from_bits(self.right.load(Ordering::Relaxed)) {
+            self.right.store(r.to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    /// Peak since the previous call, resetting the accumulator.
+    pub fn take(&self) -> (f32, f32) {
+        (
+            f32::from_bits(self.left.swap(0, Ordering::Relaxed)),
+            f32::from_bits(self.right.swap(0, Ordering::Relaxed)),
+        )
+    }
+}
+
 /// Owns the output stream and the decode/mix pipeline. `stop_all()` just
 /// clears the voice list, so it's instant regardless of how much is
 /// queued up decoding -- this is what makes the global Space-bar stop
 /// reliable no matter how many buttons were just mashed.
 pub struct AudioEngine {
-    job_tx: Sender<EngineJob>,
+    play_tx: Sender<PlayJob>,
+    prewarm_tx: Sender<PathBuf>,
     voices: Arc<Mutex<Vec<Voice>>>,
     master_gain: Arc<Mutex<f32>>,
+    peak: Arc<PeakMeter>,
     stream: cpal::Stream,
     pub device_name: Option<String>,
 }
@@ -90,26 +123,37 @@ impl AudioEngine {
 
         let voices: Arc<Mutex<Vec<Voice>>> = Arc::new(Mutex::new(Vec::new()));
         let master_gain = Arc::new(Mutex::new(1.0f32));
+        let peak: Arc<PeakMeter> = Arc::default();
 
-        let stream = build_stream(&device, voices.clone(), master_gain.clone())
+        let stream = build_stream(&device, voices.clone(), master_gain.clone(), peak.clone())
             .context("building output stream")?;
         stream.play().context("starting output stream")?;
 
-        let (job_tx, job_rx): (Sender<EngineJob>, Receiver<EngineJob>) = unbounded();
+        let (play_tx, play_rx): (Sender<PlayJob>, Receiver<PlayJob>) = unbounded();
+        let (prewarm_tx, prewarm_rx): (Sender<PathBuf>, Receiver<PathBuf>) = unbounded();
+
+        // One cache behind a mutex, shared by every worker. Previously each
+        // worker built its own `DecodeCache`, so with two workers a sound
+        // prewarmed by one was invisible to the other and a click had
+        // roughly a coin-flip chance of paying full decode cost despite
+        // the prewarm having already done that exact work.
+        let cache = Arc::new(Mutex::new(DecodeCache::new()));
 
         for _ in 0..WORKER_COUNT {
-            let job_rx = job_rx.clone();
+            let play_rx = play_rx.clone();
+            let prewarm_rx = prewarm_rx.clone();
             let voices = voices.clone();
-            thread::spawn(move || decode_worker(job_rx, voices));
+            let cache = cache.clone();
+            thread::spawn(move || decode_worker(play_rx, prewarm_rx, voices, cache));
         }
 
-        Ok(Self { job_tx, voices, master_gain, stream, device_name: resolved_name })
+        Ok(Self { play_tx, prewarm_tx, voices, master_gain, peak, stream, device_name: resolved_name })
     }
 
     /// Enqueues a play job. Never blocks the caller (UI thread) on decode
     /// work -- the actual decoding happens on the worker pool.
     pub fn play(&self, job: PlayJob) {
-        if self.job_tx.send(EngineJob::Play(job)).is_err() {
+        if self.play_tx.send(job).is_err() {
             log::error!("audio worker pool is gone; dropping play request");
         }
     }
@@ -120,7 +164,7 @@ impl AudioEngine {
     /// actually clicks one.
     pub fn prewarm(&self, paths: impl IntoIterator<Item = PathBuf>) {
         for path in paths {
-            if self.job_tx.send(EngineJob::Prewarm(path)).is_err() {
+            if self.prewarm_tx.send(path).is_err() {
                 break;
             }
         }
@@ -137,12 +181,29 @@ impl AudioEngine {
         *self.master_gain.lock().unwrap() = gain.clamp(0.0, 2.0);
     }
 
-    /// File paths (as given to `PlayJob`) with at least one voice still
-    /// sounding right now. Polled once per UI frame to drive the
-    /// now-playing glow on sound buttons -- cheap, just a mutex lock over
-    /// a handful of small voices.
-    pub fn playing_paths(&self) -> HashSet<String> {
-        self.voices.lock().unwrap().iter().map(|v| v.source.clone()).collect()
+    /// File paths currently sounding, mapped to how far through the clip
+    /// the furthest-along voice of that file is (0.0-1.0). Polled once per
+    /// UI frame to drive the now-playing glow and the progress sweep on
+    /// sound buttons -- cheap, just a mutex lock over a handful of voices.
+    /// When the same sound is retriggered while still playing, the newest
+    /// (least advanced) voice is what the user perceives, but reporting
+    /// the furthest-along one keeps the bar monotonic instead of jumping
+    /// backwards mid-sweep.
+    pub fn playing_progress(&self) -> HashMap<String, f32> {
+        let mut out: HashMap<String, f32> = HashMap::new();
+        for v in self.voices.lock().unwrap().iter() {
+            let total = v.left.len().max(1) as f32;
+            let progress = (v.pos as f32 / total).clamp(0.0, 1.0);
+            out.entry(v.source.clone())
+                .and_modify(|p| *p = p.max(progress))
+                .or_insert(progress);
+        }
+        out
+    }
+
+    /// Output peak level since the last call, for the UI's level meters.
+    pub fn peak_levels(&self) -> (f32, f32) {
+        self.peak.take()
     }
 
     pub fn pause(&self) {
@@ -188,13 +249,19 @@ impl DecodeCache {
 /// Decodes (using the shared cache) or returns the cached result. Shared
 /// by both play jobs and prewarm jobs so a prewarm followed by an actual
 /// click never decodes twice.
-fn decode_cached(cache: &mut DecodeCache, path: &Path) -> Option<Arc<Decoded>> {
+/// The decode itself deliberately happens *outside* the cache lock --
+/// holding it across `decode_file` would serialize the whole worker pool
+/// behind one slow file and undo the point of having more than one
+/// worker. Two workers racing on the same uncached path can each decode
+/// it once; that's rare, harmless, and much cheaper than the contention
+/// a decode-under-lock would cause.
+fn decode_cached(cache: &Mutex<DecodeCache>, path: &Path) -> Option<Arc<Decoded>> {
     let key = fingerprint(path);
-    if let Some(hit) = cache.get(&key) {
+    if let Some(hit) = cache.lock().unwrap().get(&key) {
         return Some(hit);
     }
     match decode::decode_file(path) {
-        Ok(d) => Some(cache.put(key, d)),
+        Ok(d) => Some(cache.lock().unwrap().put(key, d)),
         Err(e) => {
             log::error!("failed to decode {}: {e}", path.display());
             None
@@ -202,49 +269,78 @@ fn decode_cached(cache: &mut DecodeCache, path: &Path) -> Option<Arc<Decoded>> {
     }
 }
 
-fn decode_worker(job_rx: Receiver<EngineJob>, voices: Arc<Mutex<Vec<Voice>>>) {
-    let mut cache = DecodeCache::new();
-
-    while let Ok(job) = job_rx.recv() {
-        match job {
-            EngineJob::Prewarm(path) => {
-                if path.exists() {
-                    decode_cached(&mut cache, &path);
-                }
+fn decode_worker(
+    play_rx: Receiver<PlayJob>,
+    prewarm_rx: Receiver<PathBuf>,
+    voices: Arc<Mutex<Vec<Voice>>>,
+    cache: Arc<Mutex<DecodeCache>>,
+) {
+    loop {
+        // Drain every pending play before even looking at prewarm work.
+        // This is the whole reason the two are on separate channels: a
+        // click must never wait behind a tab's worth of background
+        // decodes. A click can still wait on one already-in-flight
+        // prewarm decode per worker, which is a single file's worth of
+        // delay rather than a whole tab's.
+        match play_rx.try_recv() {
+            Ok(job) => {
+                handle_play(job, &voices, &cache);
+                continue;
             }
-            EngineJob::Play(job) => {
-                if !job.path.exists() {
-                    log::warn!("play requested for missing file: {}", job.path.display());
-                    continue;
+            Err(TryRecvError::Disconnected) => return,
+            Err(TryRecvError::Empty) => {}
+        }
+
+        // Nothing to play right now, so block until either channel has
+        // work rather than spinning.
+        select! {
+            recv(play_rx) -> msg => match msg {
+                Ok(job) => handle_play(job, &voices, &cache),
+                Err(_) => return,
+            },
+            recv(prewarm_rx) -> msg => match msg {
+                Ok(path) => {
+                    if path.exists() {
+                        decode_cached(&cache, &path);
+                    }
                 }
-
-                let Some(decoded) = decode_cached(&mut cache, &job.path) else { continue };
-
-                let (left, right) = if job.pitch_semitones.abs() > 0.01 {
-                    pitch::shift_stereo(&decoded.left, &decoded.right, job.pitch_semitones, decode::TARGET_SR as f32)
-                } else {
-                    (decoded.left.clone(), decoded.right.clone())
-                };
-
-                let volume = job.volume.clamp(0.0, 2.0);
-                let left: Vec<f32> = left.iter().map(|s| s * volume).collect();
-                let right: Vec<f32> = right.iter().map(|s| s * volume).collect();
-
-                if left.is_empty() {
-                    continue;
-                }
-
-                let source = job.path.to_string_lossy().to_string();
-                voices.lock().unwrap().push(Voice { left, right, pos: 0, source });
-            }
+                Err(_) => return,
+            },
         }
     }
+}
+
+fn handle_play(job: PlayJob, voices: &Mutex<Vec<Voice>>, cache: &Mutex<DecodeCache>) {
+    if !job.path.exists() {
+        log::warn!("play requested for missing file: {}", job.path.display());
+        return;
+    }
+
+    let Some(decoded) = decode_cached(cache, &job.path) else { return };
+
+    let (left, right) = if job.pitch_semitones.abs() > 0.01 {
+        pitch::shift_stereo(&decoded.left, &decoded.right, job.pitch_semitones, decode::TARGET_SR as f32)
+    } else {
+        (decoded.left.clone(), decoded.right.clone())
+    };
+
+    let volume = job.volume.clamp(0.0, 2.0);
+    let left: Vec<f32> = left.iter().map(|s| s * volume).collect();
+    let right: Vec<f32> = right.iter().map(|s| s * volume).collect();
+
+    if left.is_empty() {
+        return;
+    }
+
+    let source = job.path.to_string_lossy().to_string();
+    voices.lock().unwrap().push(Voice { left, right, pos: 0, source });
 }
 
 fn build_stream(
     device: &cpal::Device,
     voices: Arc<Mutex<Vec<Voice>>>,
     gain: Arc<Mutex<f32>>,
+    peak: Arc<PeakMeter>,
 ) -> Result<cpal::Stream> {
     let forced = cpal::StreamConfig {
         channels: 2,
@@ -255,7 +351,9 @@ fn build_stream(
     // Prefer float32 output at our fixed 48kHz/stereo target -- matches
     // what the Python app forced via PortAudio and works transparently
     // with PipeWire/WASAPI shared-mode resampling on real hardware.
-    if let Ok(stream) = build_typed_stream::<f32>(device, forced.clone(), voices.clone(), gain.clone()) {
+    if let Ok(stream) =
+        build_typed_stream::<f32>(device, forced.clone(), voices.clone(), gain.clone(), peak.clone())
+    {
         return Ok(stream);
     }
     log::warn!("48kHz/stereo/f32 output stream not available, trying device's native config");
@@ -265,9 +363,9 @@ fn build_stream(
     let config: cpal::StreamConfig = supported.into();
 
     match sample_format {
-        cpal::SampleFormat::F32 => build_typed_stream::<f32>(device, config, voices, gain),
-        cpal::SampleFormat::I16 => build_typed_stream::<i16>(device, config, voices, gain),
-        cpal::SampleFormat::U16 => build_typed_stream::<u16>(device, config, voices, gain),
+        cpal::SampleFormat::F32 => build_typed_stream::<f32>(device, config, voices, gain, peak),
+        cpal::SampleFormat::I16 => build_typed_stream::<i16>(device, config, voices, gain, peak),
+        cpal::SampleFormat::U16 => build_typed_stream::<u16>(device, config, voices, gain, peak),
         other => Err(anyhow!("unsupported device sample format: {other:?}")),
     }
 }
@@ -277,6 +375,7 @@ fn build_typed_stream<T>(
     config: cpal::StreamConfig,
     voices: Arc<Mutex<Vec<Voice>>>,
     gain: Arc<Mutex<f32>>,
+    peak: Arc<PeakMeter>,
 ) -> Result<cpal::Stream>
 where
     T: cpal::SizedSample + cpal::FromSample<f32>,
@@ -325,9 +424,14 @@ where
                     });
                 }
 
+                let mut peak_l = 0.0f32;
+                let mut peak_r = 0.0f32;
+
                 for f in 0..frames {
                     let l = (mix[f * 2] * g).clamp(-1.0, 1.0);
                     let r = (mix[f * 2 + 1] * g).clamp(-1.0, 1.0);
+                    peak_l = peak_l.max(l.abs());
+                    peak_r = peak_r.max(r.abs());
                     let base = f * channels;
                     if channels == 1 {
                         data[base] = T::from_sample((l + r) * 0.5);
@@ -339,6 +443,8 @@ where
                         }
                     }
                 }
+
+                peak.report(peak_l, peak_r);
             },
             err_fn,
             None,

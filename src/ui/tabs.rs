@@ -74,8 +74,14 @@ pub fn show(
 
             let tab = &tabs[i];
             let accent = tab.color.as_deref().and_then(color::parse_hex);
-            let label = match &tab.emoji {
-                Some(e) if !e.is_empty() => format!("{e} {}", tab.name),
+
+            // The emoji becomes a real image on the button rather than a
+            // prefix in the label string when we have a color sprite for
+            // it; only emoji outside the atlas stay inline text.
+            let tab_emoji = tab.emoji.as_deref().filter(|e| !e.is_empty());
+            let emoji_image = tab_emoji.and_then(|e| super::emoji::image(ui.ctx(), e, 14.0));
+            let label = match (tab_emoji, emoji_image.is_some()) {
+                (Some(e), false) => format!("{e} {}", tab.name),
                 _ => tab.name.clone(),
             };
 
@@ -88,7 +94,12 @@ pub fn show(
             }
 
             let being_dragged = dragging_uuid == Some(tab_id);
-            let button = egui::Button::new(text).selected(is_current).sense(Sense::click_and_drag());
+            let button = match emoji_image {
+                Some(img) => egui::Button::image_and_text(img, text),
+                None => egui::Button::new(text),
+            }
+            .selected(is_current)
+            .sense(Sense::click_and_drag());
             let resp = ui.push_id(tab_id, |ui| ui.add(button)).inner;
             this_frame_rects.push((tab_id, resp.rect));
 

@@ -25,9 +25,17 @@ pub struct SoundButtonResult {
 /// Draws one sound button at `rect` and handles click-to-play (normal mode),
 /// drag-to-move / drag-the-corner-to-resize (edit mode), and the right-click
 /// context menu (rename, color, emoji, image, per-button volume/pitch,
-/// hotkey, delete) -- mirrors `sound_button.py`'s behavior. `is_playing`
-/// draws a pulsing glow ring while the button's file has an active voice.
-pub fn show(ui: &mut Ui, rect: Rect, model: &mut ButtonModel, edit_mode: bool, is_playing: bool) -> SoundButtonResult {
+/// hotkey, delete) -- mirrors `sound_button.py`'s behavior. `progress` is
+/// `Some(0.0..=1.0)` while the button's file has an active voice, driving
+/// both the glow and the playback sweep along the bottom edge.
+pub fn show(
+    ui: &mut Ui,
+    rect: Rect,
+    model: &mut ButtonModel,
+    edit_mode: bool,
+    progress: Option<f32>,
+) -> SoundButtonResult {
+    let is_playing = progress.is_some();
     let mut result = SoundButtonResult::default();
 
     let id = Id::new(("sound_button", model.id));
@@ -102,6 +110,24 @@ pub fn show(ui: &mut Ui, rect: Rect, model: &mut ButtonModel, edit_mode: bool, i
 
     painter.rect(rect, 8.0, bg, border, StrokeKind::Inside);
 
+    // Bevel: a light top edge and dark bottom edge, the cheap trick that
+    // makes a flat rectangle read as a physical, pressable key rather
+    // than a coloured box.
+    let pressed = response.is_pointer_button_down_on() && !edit_mode;
+    let (top_edge, bottom_edge) = if pressed {
+        (Color32::from_black_alpha(60), Color32::from_white_alpha(18))
+    } else {
+        (Color32::from_white_alpha(26), Color32::from_black_alpha(70))
+    };
+    painter.line_segment(
+        [rect.left_top() + Vec2::new(7.0, 1.5), rect.right_top() + Vec2::new(-7.0, 1.5)],
+        Stroke::new(1.5, top_edge),
+    );
+    painter.line_segment(
+        [rect.left_bottom() + Vec2::new(7.0, -1.5), rect.right_bottom() + Vec2::new(-7.0, -1.5)],
+        Stroke::new(1.5, bottom_edge),
+    );
+
     if edit_mode {
         painter.rect(
             resize_zone.shrink(3.0),
@@ -112,23 +138,114 @@ pub fn show(ui: &mut Ui, rect: Rect, model: &mut ButtonModel, edit_mode: bool, i
         );
     }
 
+    // Contrast-aware rather than always-light: the color picker lets a
+    // user choose any fill including near-white ones, and light-on-light
+    // would make the label unreadable on their own tile.
     let text_color = if model.missing_file {
         super::theme::palette::SUBTEXT.gamma_multiply(0.6)
+    } else if is_light(bg) {
+        super::theme::palette::CRUST
     } else {
         super::theme::palette::TEXT
     };
+
+    // Artwork, if the button has any. Drawn behind the label, inset and
+    // dimmed enough that text stays readable on top of it. (Setting an
+    // image was already possible via the context menu but never actually
+    // rendered -- the Python build drew it, so this closes that gap.)
+    if let Some(texture) = model.image.as_deref().and_then(|p| super::image_cache::texture_for(ui.ctx(), p)) {
+        let art_rect = rect.shrink(6.0);
+        let tint = if model.missing_file {
+            Color32::from_white_alpha(90)
+        } else {
+            Color32::from_white_alpha(180)
+        };
+        painter.image(
+            texture.id(),
+            art_rect,
+            Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
+            tint,
+        );
+    }
+
     let mut cursor_y = rect.top() + 8.0;
 
     if let Some(emoji) = model.emoji.as_deref().filter(|e| !e.is_empty()) {
-        painter.text(Pos2::new(rect.center().x, cursor_y), Align2::CENTER_TOP, emoji, FontId::proportional(20.0), text_color);
-        cursor_y += 24.0;
+        // Try the color sprite first, fall back to the monochrome font
+        // glyph for anything outside the curated atlas set.
+        const EMOJI_PX: f32 = 22.0;
+        let emoji_rect = Rect::from_center_size(
+            Pos2::new(rect.center().x, cursor_y + EMOJI_PX / 2.0),
+            Vec2::splat(EMOJI_PX),
+        );
+        if !super::emoji::paint(ui.ctx(), &painter, emoji_rect, emoji) {
+            painter.text(
+                Pos2::new(rect.center().x, cursor_y),
+                Align2::CENTER_TOP,
+                emoji,
+                FontId::proportional(20.0),
+                text_color,
+            );
+        }
+        cursor_y += 26.0;
     }
 
+    // Labels have to be laid out (wrapped + ellipsized) rather than
+    // painted raw: sound names are frequently longer than a ~96px button,
+    // and painting them unwrapped just slices words in half at the button
+    // edge, which looks broken.
     let label_rect = Rect::from_min_max(
         Pos2::new(rect.left() + 4.0, cursor_y),
-        Pos2::new(rect.right() - 4.0, rect.bottom() - 6.0),
+        Pos2::new(rect.right() - 4.0, rect.bottom() - 10.0),
     );
-    painter.text(label_rect.center(), Align2::CENTER_CENTER, &model.label, FontId::proportional(13.0), text_color);
+    let galley = {
+        let mut job = egui::text::LayoutJob::single_section(
+            model.label.clone(),
+            egui::TextFormat {
+                font_id: FontId::proportional(if rect.width() < 80.0 { 11.0 } else { 13.0 }),
+                color: text_color,
+                ..Default::default()
+            },
+        );
+        job.halign = Align2::CENTER_CENTER.x();
+        job.wrap = egui::text::TextWrapping {
+            max_width: label_rect.width().max(8.0),
+            max_rows: ((label_rect.height() / 15.0).floor() as usize).max(1),
+            break_anywhere: false,
+            overflow_character: Some('…'),
+        };
+        painter.layout_job(job)
+    };
+    let text_pos = label_rect.center() - galley.size() / 2.0;
+    painter.galley(text_pos, galley, text_color);
+
+    // Hotkey badge, so an assigned trigger is visible on the face of the
+    // button instead of buried in the context menu.
+    if let Some(hotkey) = model.hotkey.as_deref().filter(|h| !h.trim().is_empty()) {
+        let badge_pos = Pos2::new(rect.left() + 5.0, rect.top() + 4.0);
+        painter.text(
+            badge_pos,
+            Align2::LEFT_TOP,
+            hotkey,
+            FontId::monospace(9.0),
+            super::theme::palette::LAVENDER.gamma_multiply(0.85),
+        );
+    }
+
+    // Playback sweep along the bottom edge -- shows how far through the
+    // clip you are, which matters for the longer drops and bits.
+    if let Some(p) = progress {
+        let track = Rect::from_min_max(
+            Pos2::new(rect.left() + 4.0, rect.bottom() - 6.0),
+            Pos2::new(rect.right() - 4.0, rect.bottom() - 3.5),
+        );
+        painter.rect_filled(track, 1.25, super::theme::palette::CRUST.gamma_multiply(0.8));
+        let filled = Rect::from_min_max(
+            track.min,
+            Pos2::new(track.left() + track.width() * p.clamp(0.0, 1.0), track.max.y),
+        );
+        painter.rect_filled(filled, 1.25, super::theme::palette::MAUVE);
+    }
 
     if model.missing_file {
         response.clone().on_hover_text("Audio file missing. Re-link or re-import.");
@@ -166,16 +283,48 @@ fn show_context_menu(response: &egui::Response, edit_mode: bool, id: Id, model: 
 
         ui.separator();
 
-        ui.horizontal(|ui| {
-            ui.label("Color");
-            let mut c = model.color.as_deref().and_then(color::parse_hex).unwrap_or(Color32::from_gray(32));
-            if egui::color_picker::color_edit_button_srgba(ui, &mut c, egui::color_picker::Alpha::Opaque).changed() {
+        // `color_edit_button_srgba` opens its picker in a popup of its own,
+        // and that popup is not a child of this menu popup -- so clicking
+        // into the picker registered as a click *outside* the menu, egui
+        // closed the menu, and the picker died with it before any color
+        // could be chosen. That was the "tile color picker does not work"
+        // bug: not a broken picker, a picker that closed the instant it
+        // was touched. Hosting it in a `menu_button` submenu instead puts
+        // it inside egui's own menu nesting, which is built to survive
+        // exactly this (the Emoji submenu below already relies on it).
+        let current = model.color.as_deref().and_then(color::parse_hex);
+        ui.menu_button(format!("Color {}", if current.is_some() { "●" } else { "—" }), |ui| {
+            let mut c = current.unwrap_or(Color32::from_gray(32));
+
+            // Theme swatches first: picking a tile color is nearly always
+            // "make this one visually distinct from its neighbors", and a
+            // one-click palette does that far faster than a colour wheel.
+            ui.label("Presets");
+            ui.horizontal_wrapped(|ui| {
+                for preset in super::theme::palette::TILE_PRESETS {
+                    if ui
+                        .add(egui::Button::new("").fill(*preset).min_size(Vec2::splat(22.0)))
+                        .clicked()
+                    {
+                        model.color = Some(color::to_hex(*preset));
+                        result.changed = true;
+                        ui.close();
+                    }
+                }
+            });
+
+            ui.separator();
+
+            if egui::color_picker::color_picker_color32(ui, &mut c, egui::color_picker::Alpha::Opaque) {
                 model.color = Some(color::to_hex(c));
                 result.changed = true;
             }
-            if ui.small_button("Clear").clicked() {
+
+            ui.separator();
+            if ui.button("Clear color").clicked() {
                 model.color = None;
                 result.changed = true;
+                ui.close();
             }
         });
 
@@ -256,6 +405,13 @@ fn show_context_menu(response: &egui::Response, edit_mode: bool, id: Id, model: 
             ui.close();
         }
     });
+}
+
+/// Rec. 601 perceived luminance, used only to decide light-vs-dark label
+/// text on a user-chosen tile fill.
+fn is_light(c: Color32) -> bool {
+    let l = 0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32;
+    l > 140.0
 }
 
 fn tint_toward(base: Color32, target: Color32, amount: f32) -> Color32 {

@@ -42,7 +42,14 @@ pub fn grid(ui: &mut Ui, search: &str) -> Option<&'static str> {
                 if !search.is_empty() && !emoji.contains(search) {
                     continue;
                 }
-                if ui.add_sized(btn_size, egui::Button::new(*emoji)).clicked() {
+                // Color sprite where we have one, text glyph otherwise --
+                // picking from a grid of monochrome silhouettes would
+                // defeat the point of coloring them on the buttons.
+                let clicked = match super::emoji::image(ui.ctx(), emoji, 20.0) {
+                    Some(img) => ui.add_sized(btn_size, egui::Button::image(img)).clicked(),
+                    None => ui.add_sized(btn_size, egui::Button::new(*emoji)).clicked(),
+                };
+                if clicked {
                     picked = Some(*emoji);
                 }
                 in_row += 1;
