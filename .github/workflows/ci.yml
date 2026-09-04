@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Fast sanity check on every push/PR: does it build, do the offline unit
+  # tests pass. Does NOT run the live-network importer test (see
+  # src/importers/realm_of_darkness.rs's #[ignore]d test) -- that one is
+  # for manual verification against the real site, not CI.
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libgtk-3-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --verbose
+      - run: cargo test --verbose
+
+  # Only on version tags: build release artifacts for Linux (RPM) and
+  # Windows (portable .exe), then publish them to a GitHub Release.
+  linux-rpm:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libgtk-3-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-generate-rpm
+      - run: cargo build --release
+      - run: cargo generate-rpm
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ultimate-soundboard-rpm
+          path: target/generate-rpm/*.rpm
+
+  # Builds the Flatpak with flathub-infra's prebuilt freedesktop-24.08
+  # container (matches packaging/flatpak's runtime-version), so this needs
+  # nothing installed on the runner beyond the action itself. Runs on
+  # every push/PR too (not just tags) since it's the only place this repo
+  # actually verifies the manifest + cargo-sources.json still build --
+  # flatpak-builder isn't available in the normal dev environment.
+  flatpak:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-24.08
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: ultimate-soundboard.flatpak
+          manifest-path: packaging/flatpak/io.github.zerodaylabz.UltimateSoundboard.yml
+          cache-key: flatpak-builder-${{ github.sha }}
+          artifact-name: ultimate-soundboard-flatpak
+
+  windows-exe:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: Package portable zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Copy-Item target/release/ultimate-soundboard.exe dist/
+          Copy-Item packaging/windows/README.txt dist/ -ErrorAction SilentlyContinue
+          Compress-Archive -Path dist/* -DestinationPath ultimate-soundboard-windows.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ultimate-soundboard-windows
+          path: ultimate-soundboard-windows.zip
+
+  release:
+    needs: [linux-rpm, windows-exe, flatpak]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/ultimate-soundboard-rpm/*.rpm
+            artifacts/ultimate-soundboard-windows/*.zip
+            artifacts/ultimate-soundboard-flatpak/*.flatpak
+          generate_release_notes: true

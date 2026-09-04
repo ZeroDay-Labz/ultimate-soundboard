@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Ultimate Soundboard
+GenericName=Soundboard
+Comment=A tabbed soundboard workspace for drag-and-drop sound clips
+Exec=ultimate-soundboard
+Icon=io.github.zerodaylabz.UltimateSoundboard
+Terminal=false
+Categories=AudioVideo;Audio;Utility;
+Keywords=soundboard;audio;sound;discord;streaming;
+StartupWMClass=Ultimate Soundboard

@@ -1,0 +1,56 @@
+# Flatpak manifest for Ultimate Soundboard (ZeroDay-Labz).
+#
+# Build (needs `flatpak-builder` and the freedesktop 24.08 SDK + rust-stable
+# extension installed -- see packaging/flatpak/README.md; CI builds this
+# automatically via .github/workflows/ci.yml using a prebuilt container, no
+# local install needed there):
+#   flatpak-builder --user --install --force-clean build-dir \
+#     packaging/flatpak/io.github.zerodaylabz.UltimateSoundboard.yml
+#
+# cargo-sources.json is pre-generated (from Cargo.lock, via flatpak's own
+# flatpak-cargo-generator.py) so the build can run fully offline inside the
+# sandbox, the same way Flathub requires. Regenerate it after any Cargo.lock
+# change: see packaging/flatpak/README.md.
+
+app-id: io.github.zerodaylabz.UltimateSoundboard
+runtime: org.freedesktop.Platform
+runtime-version: '24.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: ultimate-soundboard
+
+finish-args:
+  # Display
+  - --socket=x11
+  - --socket=fallback-x11
+  - --socket=wayland
+  - --device=dri
+  # Audio output (PipeWire's PulseAudio-compatible socket)
+  - --socket=pulseaudio
+  # Global Space-to-stop-all and per-button hotkeys need real X11 key
+  # access (see src/ui/app.rs -- this is a documented Wayland limitation
+  # of the `global-hotkey` crate, not something the sandbox can fix).
+  # Broad home access so drag-and-dropped/picked sound files anywhere in
+  # the user's home directory keep working "in place", as designed.
+  - --filesystem=home
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/ultimate-soundboard/cargo-home
+
+modules:
+  - name: ultimate-soundboard
+    buildsystem: simple
+    build-commands:
+      - cargo --offline build --release --locked
+      - install -Dm755 target/release/ultimate-soundboard /app/bin/ultimate-soundboard
+      - install -Dm644 packaging/linux/ultimate-soundboard.desktop
+        /app/share/applications/io.github.zerodaylabz.UltimateSoundboard.desktop
+      - install -Dm644 packaging/linux/icon.png
+        /app/share/icons/hicolor/256x256/apps/io.github.zerodaylabz.UltimateSoundboard.png
+    sources:
+      - type: dir
+        path: ../..
+      - cargo-sources.json

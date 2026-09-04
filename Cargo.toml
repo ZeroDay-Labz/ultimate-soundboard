@@ -1,0 +1,67 @@
+[package]
+name = "ultimate_soundboard"
+version = "0.1.0"
+edition = "2024"
+description = "A cross-platform soundboard workspace with tabs, drag-and-drop imports, and routable audio output."
+license = "MIT"
+
+[[bin]]
+name = "ultimate-soundboard"
+path = "src/main.rs"
+
+[dependencies]
+# GUI
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "persistence", "wayland", "x11"] }
+egui = "0.36"
+egui_extras = { version = "0.36", features = ["image"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+
+# Audio I/O + decode + DSP
+cpal = "0.18"
+symphonia = { version = "0.5", features = ["mp3", "aac", "isomp4", "aiff"] }
+rubato = "0.16"
+pitch_shift = "2"
+
+# State / persistence
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+dirs = "6"
+zip = { version = "8", default-features = false, features = ["deflate"] }
+walkdir = "2"
+
+# Importers
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+scraper = "0.20"
+regex = "1"
+url = "2"
+swf = "0.2"
+
+# Misc
+rfd = "0.17"
+global-hotkey = "0.8"
+crossbeam-channel = "0.5"
+lru = "0.12"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+
+[package.metadata.generate-rpm]
+name = "ultimate-soundboard"
+license = "MIT"
+assets = [
+    { source = "target/release/ultimate-soundboard", dest = "/usr/bin/ultimate-soundboard", mode = "755" },
+    { source = "packaging/linux/ultimate-soundboard.desktop", dest = "/usr/share/applications/ultimate-soundboard.desktop", mode = "644" },
+    { source = "packaging/linux/icon.png", dest = "/usr/share/icons/hicolor/256x256/apps/io.github.zerodaylabz.UltimateSoundboard.png", mode = "644" },
+]
+# Runtime deps this app actually needs on top of glibc: ALSA/PulseAudio for
+# cpal, GTK3 for the native file/folder dialogs (rfd), and ffmpeg as the
+# opus/weird-format decode fallback (optional at runtime, but strongly
+# recommended -- most desktops already have it via other apps).
+requires = { alsa-lib = "*", gtk3 = "*" }
+recommends = { ffmpeg-free = "*" }
