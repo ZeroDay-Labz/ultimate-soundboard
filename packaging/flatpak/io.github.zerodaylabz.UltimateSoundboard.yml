@@ -1,6 +1,6 @@
 # Flatpak manifest for Ultimate Soundboard (ZeroDay-Labz).
 #
-# Build (needs `flatpak-builder` and the freedesktop 24.08 SDK + rust-stable
+# Build (needs `flatpak-builder` and the freedesktop 25.08 SDK + rust-stable
 # extension installed -- see packaging/flatpak/README.md; CI builds this
 # automatically via .github/workflows/ci.yml using a prebuilt container, no
 # local install needed there):
@@ -11,10 +11,14 @@
 # flatpak-cargo-generator.py) so the build can run fully offline inside the
 # sandbox, the same way Flathub requires. Regenerate it after any Cargo.lock
 # change: see packaging/flatpak/README.md.
+#
+# Pinned to 25.08 (not 24.08) because its rust-stable extension is the
+# first branch new enough for egui 0.36's rustc 1.95+ requirement --
+# 24.08's rust-stable only ships rustc 1.89, confirmed by a failed CI run.
 
 app-id: io.github.zerodaylabz.UltimateSoundboard
 runtime: org.freedesktop.Platform
-runtime-version: '24.08'
+runtime-version: '25.08'
 sdk: org.freedesktop.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable

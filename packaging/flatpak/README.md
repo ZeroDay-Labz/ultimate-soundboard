@@ -4,13 +4,13 @@
 
 ```sh
 sudo dnf install flatpak-builder            # Fedora
-flatpak install flathub org.freedesktop.Platform//24.08 org.freedesktop.Sdk//24.08
-flatpak install flathub org.freedesktop.Sdk.Extension.rust-stable//24.08
+flatpak install flathub org.freedesktop.Platform//25.08 org.freedesktop.Sdk//25.08
+flatpak install flathub org.freedesktop.Sdk.Extension.rust-stable//25.08
 ```
 
 CI builds and verifies this manifest on every push via
 `.github/workflows/ci.yml`, using the prebuilt
-`ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-24.08` container
+`ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-25.08` container
 -- so you don't need any of the above installed locally just to know the
 manifest still builds; only for building/running it on your own machine.
 

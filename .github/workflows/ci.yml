@@ -50,7 +50,7 @@ jobs:
           name: ultimate-soundboard-rpm
           path: target/generate-rpm/*.rpm
 
-  # Builds the Flatpak with flathub-infra's prebuilt freedesktop-24.08
+  # Builds the Flatpak with flathub-infra's prebuilt freedesktop-25.08
   # container (matches packaging/flatpak's runtime-version), so this needs
   # nothing installed on the runner beyond the action itself. Runs on
   # every push/PR too (not just tags) since it's the only place this repo
@@ -59,7 +59,7 @@ jobs:
   flatpak:
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-24.08
+      image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-25.08
       options: --privileged
     steps:
       - uses: actions/checkout@v4
