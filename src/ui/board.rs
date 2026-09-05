@@ -1,23 +1,37 @@
 use std::collections::HashMap;
 
-use egui::{FontId, Pos2, Rect, RichText, ScrollArea, Sense, Slider, Ui, Vec2};
+use egui::{FontId, Pos2, Rect, RichText, ScrollArea, Sense, Ui, Vec2};
 
 use crate::model::{ButtonModel, LayoutMode, TabModel};
 
 use super::sound_button;
+use super::widgets::slider_with_reset;
 
 pub struct PlayRequest {
     pub file: String,
     pub volume: f32,
     pub pitch_semitones: f32,
+    /// Lets the engine find this sound's voices again while it plays, so
+    /// the button's volume and pitch sliders stay live.
+    pub button_id: uuid::Uuid,
+}
+
+/// A live volume/pitch change for a button that may already be sounding.
+pub struct MixUpdate {
+    pub button_id: uuid::Uuid,
+    pub file: String,
+    pub volume: f32,
+    pub semitones: f32,
 }
 
 #[derive(Default)]
 pub struct BoardResult {
     pub play: Option<PlayRequest>,
+    pub mix_update: Option<MixUpdate>,
     pub changed: bool,
     pub hotkeys_changed: bool,
     pub delete: Option<uuid::Uuid>,
+    pub duplicate: Option<uuid::Uuid>,
 }
 
 /// Renders one tab's controls row + button board (grid or free-form,
@@ -31,6 +45,7 @@ pub fn show(
     tab: &mut TabModel,
     playing: &HashMap<String, f32>,
     filter: &str,
+    default_button_size: u32,
 ) -> BoardResult {
     let mut result = BoardResult::default();
 
@@ -44,7 +59,11 @@ pub fn show(
     ui.add_space(2.0);
     ui.horizontal(|ui| {
         micro_label(ui, "VOL");
-        if ui.add(Slider::new(&mut tab.volume, 0.0..=2.0).show_value(false).step_by(0.01)).changed() {
+        if slider_with_reset(ui, &mut tab.volume, 0.0..=2.0, 1.0, |s| {
+            s.show_value(false).step_by(0.01)
+        })
+        .changed()
+        {
             result.changed = true;
         }
         // Every slider gets a readout. Vol and Pitch used to show no
@@ -55,14 +74,18 @@ pub fn show(
 
         ui.add_space(8.0);
         micro_label(ui, "PITCH");
-        if ui.add(Slider::new(&mut tab.pitch, 0.25..=4.0).show_value(false).step_by(0.01)).changed() {
+        if slider_with_reset(ui, &mut tab.pitch, 0.25..=4.0, 1.0, |s| {
+            s.show_value(false).step_by(0.01)
+        })
+        .changed()
+        {
             result.changed = true;
         }
         readout(ui, format!("{:.2}×", tab.pitch));
 
         ui.add_space(8.0);
         micro_label(ui, "SIZE");
-        if ui.add(Slider::new(&mut tab.button_size, 48..=200)).changed() {
+        if slider_with_reset(ui, &mut tab.button_size, 48..=200, default_button_size, |s| s).changed() {
             // Grid layout derives every button's size from `tab.button_size`
             // directly, but free-form layout draws each button from its own
             // `width`/`height`. So without this the Size slider silently
@@ -89,7 +112,11 @@ pub fn show(
         let grid_applies = tab.layout_mode == LayoutMode::Grid;
         ui.add_space(8.0);
         micro_label(ui, "GAP");
-        let gap_resp = ui.add_enabled(grid_applies, Slider::new(&mut tab.grid_spacing, 0..=40));
+        let gap_resp = ui
+            .add_enabled_ui(grid_applies, |ui| {
+                slider_with_reset(ui, &mut tab.grid_spacing, 0..=40, 8, |s| s)
+            })
+            .inner;
         if gap_resp.changed() {
             result.changed = true;
         }
@@ -115,7 +142,7 @@ pub fn show(
 
         ui.add_space(8.0);
         micro_label(ui, "SNAP").on_hover_text("Snaps button position while dragging in Edit mode.");
-        if ui.add(Slider::new(&mut tab.snap_size, 0..=64)).changed() {
+        if slider_with_reset(ui, &mut tab.snap_size, 0..=64, 10, |s| s).changed() {
             result.changed = true;
         }
 
@@ -164,7 +191,7 @@ pub fn show(
         });
     }
 
-    ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+    ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
         if tab.buttons.is_empty() {
             show_empty_state(ui);
         } else if show_grid {
@@ -345,7 +372,12 @@ fn apply_button(
         let volume = (btn.volume * tab_volume).clamp(0.0, 2.0);
         let semitones = crate::audio::pitch::ratio_to_semitones(btn.pitch)
             + crate::audio::pitch::ratio_to_semitones(tab_pitch);
-        result.play = Some(PlayRequest { file: btn.file.clone(), volume, pitch_semitones: semitones });
+        result.play = Some(PlayRequest {
+            file: btn.file.clone(),
+            volume,
+            pitch_semitones: semitones,
+            button_id: btn.id,
+        });
     }
     if r.geometry_changed {
         // Snap on release, not every frame -- snapping continuously while
@@ -359,11 +391,20 @@ fn apply_button(
     if r.changed {
         result.changed = true;
     }
+    if r.mix_changed {
+        let volume = (btn.volume * tab_volume).clamp(0.0, 2.0);
+        let semitones = crate::audio::pitch::ratio_to_semitones(btn.pitch)
+            + crate::audio::pitch::ratio_to_semitones(tab_pitch);
+        result.mix_update = Some(MixUpdate { button_id: btn.id, file: btn.file.clone(), volume, semitones });
+    }
     if r.hotkey_changed {
         result.hotkeys_changed = true;
     }
     if r.delete_requested {
         result.delete = Some(btn.id);
+    }
+    if r.duplicate_requested {
+        result.duplicate = Some(btn.id);
     }
 }
 

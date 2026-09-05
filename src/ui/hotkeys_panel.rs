@@ -87,7 +87,22 @@ pub fn show(ctx: &Context, open: &mut bool, tabs: &[TabModel], global_hotkeys_av
 
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Space").monospace().strong());
-                ui.label(RichText::new("stop all sounds (always bound)").color(palette::SUBTEXT));
+                ui.label(
+                    RichText::new("stop all sounds (while this window is focused)")
+                        .color(palette::SUBTEXT),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(crate::ui::app::GLOBAL_STOP_LABEL).monospace().strong());
+                ui.label(RichText::new("stop all sounds (system-wide)").color(palette::SUBTEXT));
+            });
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Ctrl+F").monospace().strong());
+                ui.label(RichText::new("search this board").color(palette::SUBTEXT));
+            });
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Ctrl+Z").monospace().strong());
+                ui.label(RichText::new("undo the last delete").color(palette::SUBTEXT));
             });
             ui.separator();
 

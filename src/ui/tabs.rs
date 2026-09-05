@@ -32,11 +32,28 @@ type RectsById = Vec<(uuid::Uuid, egui::Rect)>;
 /// further right will land until they've been laid out, so "one frame
 /// stale" is the standard trick immediate-mode drag-reorder relies on. At
 /// 60fps this is imperceptible.
+/// In-progress tab rename. `focus_requested` exists because focus has to
+/// be grabbed exactly once, when the field appears: calling
+/// `request_focus()` every frame (as this used to) re-grabs focus the
+/// instant it's lost, so `lost_focus()` never fires and there is
+/// literally no way to commit or dismiss the rename.
+pub struct TabRename {
+    pub index: usize,
+    pub name: String,
+    pub focus_requested: bool,
+}
+
+impl TabRename {
+    pub fn new(index: usize, name: String) -> Self {
+        Self { index, name, focus_requested: false }
+    }
+}
+
 pub fn show(
     ui: &mut Ui,
     tabs: &mut [TabModel],
     current: usize,
-    renaming: &mut Option<(usize, String)>,
+    renaming: &mut Option<TabRename>,
 ) -> TabsAction {
     let mut action = TabsAction::default();
 
@@ -54,16 +71,27 @@ pub fn show(
         for i in 0..tabs.len() {
             let tab_id = tabs[i].id;
             let is_current = i == current;
-            let is_renaming = renaming.as_ref().map(|(idx, _)| *idx == i).unwrap_or(false);
+            let is_renaming = renaming.as_ref().map(|r| r.index == i).unwrap_or(false);
 
             if is_renaming {
                 let tab = &mut tabs[i];
-                let (_, name) = renaming.as_mut().unwrap();
-                let resp = ui.text_edit_singleline(name);
-                resp.request_focus();
-                if resp.lost_focus() {
-                    let (_, name) = renaming.take().unwrap();
-                    let trimmed = name.trim();
+                let state = renaming.as_mut().unwrap();
+                let resp = ui.add(egui::TextEdit::singleline(&mut state.name).desired_width(110.0));
+
+                // Once only -- see `TabRename`.
+                if !state.focus_requested {
+                    state.focus_requested = true;
+                    resp.request_focus();
+                }
+
+                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+
+                if escape {
+                    renaming.take();
+                } else if enter || resp.lost_focus() {
+                    let state = renaming.take().unwrap();
+                    let trimmed = state.name.trim();
                     if !trimmed.is_empty() {
                         tab.name = trimmed.chars().take(48).collect();
                     }
@@ -137,14 +165,85 @@ pub fn show(
                 action.switch_to = Some(i);
             }
             if resp.double_clicked() {
-                *renaming = Some((i, tab.name.clone()));
+                *renaming = Some(TabRename::new(i, tab.name.clone()));
             }
 
+            let tab_name = tabs[i].name.clone();
             resp.context_menu(|ui| {
+                ui.set_min_width(190.0);
+
                 if ui.button("Rename").clicked() {
-                    *renaming = Some((i, tab.name.clone()));
+                    *renaming = Some(TabRename::new(i, tab_name.clone()));
                     ui.close();
                 }
+
+                // Colour and emoji are set here rather than in a dialog,
+                // matching how a tile is customized. Both were rendered
+                // by the tab strip already but there was no way to
+                // actually set either one.
+                let tab = &mut tabs[i];
+                let current_color = tab.color.as_deref().and_then(color::parse_hex);
+
+                ui.menu_button(
+                    format!("Color {}", if current_color.is_some() { "●" } else { "—" }),
+                    |ui| {
+                        let mut c = current_color.unwrap_or(palette::LAVENDER);
+
+                        ui.label("Presets");
+                        ui.horizontal_wrapped(|ui| {
+                            for preset in palette::TAB_PRESETS {
+                                if ui
+                                    .add(egui::Button::new("").fill(*preset).min_size(egui::vec2(22.0, 22.0)))
+                                    .clicked()
+                                {
+                                    tab.color = Some(color::to_hex(*preset));
+                                    action.changed = true;
+                                    ui.close();
+                                }
+                            }
+                        });
+
+                        ui.separator();
+                        if egui::color_picker::color_picker_color32(
+                            ui,
+                            &mut c,
+                            egui::color_picker::Alpha::Opaque,
+                        ) {
+                            tab.color = Some(color::to_hex(c));
+                            action.changed = true;
+                        }
+
+                        ui.separator();
+                        if ui.button("Clear color").clicked() {
+                            tab.color = None;
+                            action.changed = true;
+                            ui.close();
+                        }
+                    },
+                );
+
+                ui.menu_button(
+                    format!("Emoji {}", tab.emoji.as_deref().unwrap_or("")),
+                    |ui| {
+                        let search_id = egui::Id::new(("tab_emoji_search", tab_id));
+                        let mut search = ui
+                            .memory_mut(|m| m.data.get_temp::<String>(search_id).unwrap_or_default());
+                        if ui.text_edit_singleline(&mut search).changed() {
+                            ui.memory_mut(|m| m.data.insert_temp(search_id, search.clone()));
+                        }
+                        if let Some(chosen) = super::emoji_picker::grid(ui, &search) {
+                            tab.emoji = Some(chosen.to_string());
+                            action.changed = true;
+                            ui.close();
+                        }
+                        if ui.small_button("Clear emoji").clicked() {
+                            tab.emoji = None;
+                            action.changed = true;
+                            ui.close();
+                        }
+                    },
+                );
+
                 ui.separator();
                 if ui.button(RichText::new("Delete tab").color(palette::RED)).clicked() {
                     action.delete = Some(i);

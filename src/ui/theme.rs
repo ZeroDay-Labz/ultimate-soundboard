@@ -51,6 +51,15 @@ pub mod palette {
     /// still reads as a row of LEDs when nothing is playing.
     pub const LED_OFF: Color32 = Color32::from_rgb(0x25, 0x27, 0x35);
 
+    /// One-click accents for the tab colour picker. Brighter than the
+    /// tile presets because a tab's colour is drawn as a thin indicator
+    /// lamp and label tint, not as a full background behind text.
+    pub const TAB_PRESETS: &[Color32] = &[
+        LAVENDER, BLUE, GREEN, YELLOW, RED, MAUVE,
+        Color32::from_rgb(0x94, 0xe2, 0xd5), // teal
+        Color32::from_rgb(0xfa, 0xb3, 0x87), // peach
+    ];
+
     /// One-click fills for the tile color picker. Deliberately dark and
     /// muted rather than the bright accent hues above: these are used as
     /// full-tile backgrounds behind light label text, so they need to sit

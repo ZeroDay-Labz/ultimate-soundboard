@@ -13,5 +13,6 @@ pub mod sound_button;
 pub mod tabs;
 pub mod theme;
 pub mod toast;
+pub mod widgets;
 
 pub use app::SoundboardApp;

@@ -69,9 +69,7 @@ pub fn show(ui: &mut Ui, meter: &LevelMeter, volume: &mut f32, muted: &mut bool)
     }
 
     // ---- fader + readout ----
-    let slider = egui::Slider::new(volume, 0.0..=2.0).show_value(false);
-    if ui
-        .add_sized([96.0, 18.0], slider)
+    if super::widgets::slider_with_reset(ui, volume, 0.0..=2.0, 1.0, |s| s.show_value(false))
         .on_hover_text("Master volume (100% is unity gain)")
         .changed()
     {

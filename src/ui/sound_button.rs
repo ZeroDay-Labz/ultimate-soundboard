@@ -20,6 +20,12 @@ pub struct SoundButtonResult {
     pub hotkey_changed: bool,
     /// User chose Delete from the context menu.
     pub delete_requested: bool,
+    /// User chose Duplicate from the context menu.
+    pub duplicate_requested: bool,
+    /// Volume or pitch changed -- the caller re-applies it to anything
+    /// this button already has sounding, so the sliders act on live audio
+    /// instead of only on the next trigger.
+    pub mix_changed: bool,
 }
 
 /// Draws one sound button at `rect` and handles click-to-play (normal mode),
@@ -312,13 +318,28 @@ fn show_context_menu(response: &egui::Response, edit_mode: bool, id: Id, model: 
         .kind(egui::PopupKind::Menu)
         .layout(egui::Layout::top_down_justified(egui::Align::Min))
         .at_pointer_fixed()
+        // egui's default is CloseOnClick, which closes the popup on *any*
+        // click including ones inside it -- so clicking into the rename
+        // box (or grabbing the volume slider) dismissed the whole menu
+        // before you could type. This menu is a settings panel, not a list
+        // of one-shot commands, so it stays open until you click away;
+        // the entries that really are one-shot call `ui.close()`
+        // themselves.
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .open_memory(should_open.then_some(egui::SetOpenCommand::Bool(true)))
         .show(|ui| {
         ui.set_min_width(220.0);
 
         ui.label("Rename");
-        if ui.text_edit_singleline(&mut model.label).lost_focus() {
+        let rename = ui.text_edit_singleline(&mut model.label);
+        // Enter commits and dismisses, the way every rename field people
+        // have used works. Clicking away still commits too -- the text is
+        // edited in place, so there's nothing to discard.
+        if rename.lost_focus() {
             result.changed = true;
+            if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                ui.close();
+            }
         }
 
         ui.separator();
@@ -409,13 +430,26 @@ fn show_context_menu(response: &egui::Response, edit_mode: bool, id: Id, model: 
         ui.separator();
 
         ui.label("Volume");
-        if ui.add(egui::Slider::new(&mut model.volume, 0.0..=2.0).show_value(true)).changed() {
+        if super::widgets::slider_with_reset(ui, &mut model.volume, 0.0..=2.0, 1.0, |s| {
+            s.show_value(true)
+        })
+        .changed()
+        {
+            // Marked as a live change so the caller can push it straight
+            // to anything this button already has sounding, rather than
+            // waiting for the next trigger.
             result.changed = true;
+            result.mix_changed = true;
         }
 
         ui.label("Pitch");
-        if ui.add(egui::Slider::new(&mut model.pitch, 0.25..=4.0).show_value(true)).changed() {
+        if super::widgets::slider_with_reset(ui, &mut model.pitch, 0.25..=4.0, 1.0, |s| {
+            s.show_value(true)
+        })
+        .changed()
+        {
             result.changed = true;
+            result.mix_changed = true;
         }
 
         ui.separator();
@@ -439,6 +473,15 @@ fn show_context_menu(response: &egui::Response, edit_mode: bool, id: Id, model: 
         }
 
         ui.separator();
+
+        if ui
+            .button("Duplicate")
+            .on_hover_text("Add a copy of this tile, with its own colour, emoji, volume and pitch")
+            .clicked()
+        {
+            result.duplicate_requested = true;
+            ui.close();
+        }
 
         if ui.button(egui::RichText::new("Delete").color(Color32::LIGHT_RED)).clicked() {
             result.delete_requested = true;

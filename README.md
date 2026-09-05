@@ -16,8 +16,9 @@ proper cross-platform packaged app instead of a dev script.
 
 ## Features
 
-- **Tabs** -- rename, set an emoji + accent color per tab so boards are
-  distinguishable at a glance.
+- **Tabs** -- rename (double-click, Enter to commit), and right-click for
+  an emoji and any accent colour you like, so boards are distinguishable
+  at a glance.
 - **Drag-and-drop** -- drop audio files onto a tab to add buttons, drop a
   folder to create a new tab pre-populated from it, drop a `.zip` to
   import a soundboard pack. Files are referenced in place, never moved or
@@ -26,9 +27,16 @@ proper cross-platform packaged app instead of a dev script.
   Opus and Discord-style `.ogg`/`.opus` files fall back to `ffmpeg` if it's
   available (same approach the Python prototype used).
 - **True pitch-shift** -- duration-preserving per-button and per-tab pitch,
-  not just a playback-rate change.
-- **Global Stop** -- Space instantly stops every sound, system-wide on
-  Windows/macOS/X11 (Wayland has no API for this -- see below).
+  not just a playback-rate change. Renderings are cached per (file, pitch)
+  and pre-warmed, so a pitched button triggers as fast as an unpitched one.
+- **Live volume and pitch** -- a tile's sliders act on sound that is
+  already playing. Volume glides instead of stepping (no zipper noise);
+  pitch re-renders and crossfades in, keeping its position. Double-click
+  any slider to snap it back to its default.
+- **Stop** -- `Space` stops everything while the window is focused;
+  `Ctrl+Shift+Space` does it system-wide on Windows/macOS/X11 (Wayland has
+  no API for this -- see below). Stops release over ~15ms rather than
+  cutting samples dead, which is what stops a busy board popping.
 - **Per-button global hotkeys** -- trigger a specific sound while another
   app (Discord, a softphone) has focus. The Hotkeys panel lists every
   binding at once and flags duplicates, which otherwise fail silently
@@ -38,6 +46,9 @@ proper cross-platform packaged app instead of a dev script.
   place so a hand-built layout never rearranges itself.
 - **Undo** -- deleting a tab asks first, and both tab and button deletes
   can be reversed with `Ctrl+Z` or the Undo button on the toast.
+- **Duplicate** -- right-click a tile to copy it, keeping its colour,
+  emoji, volume and pitch (the copy starts without the hotkey, since two
+  buttons on one combo leaves the second silently dead).
 - **Audio output routing** -- pick a specific output device so the board
   plays into a virtual cable/Voicemeeter input on Windows, or shows up as a
   routable node in `pavucontrol`/`qpwgraph`/`helvum` on Linux (PipeWire).
@@ -57,7 +68,6 @@ proper cross-platform packaged app instead of a dev script.
 
 ### Not yet built
 
-- "Chained" soundboards (idea still being scoped).
 - "Chained" soundboards (idea still being scoped).
 
 ## Building
@@ -86,13 +96,20 @@ Wayland, Space and per-button hotkeys still work while the app window
 itself has focus; the app tells you this in the top bar when it detects
 global registration isn't available.
 
+The system-wide stop is `Ctrl+Shift+Space`, not a bare `Space`. A global
+hotkey takes a display-wide grab on its key (an `XGrabKey` on X11), so
+registering an unmodified key stops that key being delivered to anything
+else -- including this app's own rename fields, and including every other
+program on the desktop. Space on its own is therefore handled as an
+ordinary in-window shortcut, which grabs nothing.
+
 ## Packaging
 
-| Target  | How                                                                               | Status                                                                                                                                                     |
-|---------|-----------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| RPM     | `cargo install cargo-generate-rpm && cargo build --release && cargo generate-rpm` | Verified -- produces a correctly-tagged `.rpm` with auto-detected `.so` deps in `target/generate-rpm/`                                                     |
+| Target  | How                                                                               | Status                                                                                                                                                                                                                                     |
+|---------|-----------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| RPM     | `cargo install cargo-generate-rpm && cargo build --release && cargo generate-rpm` | Verified -- produces a correctly-tagged `.rpm` with auto-detected `.so` deps in `target/generate-rpm/`                                                                                                                                     |
 | Flatpak | `packaging/flatpak/` -- see [its README](packaging/flatpak/README.md)             | Verified in CI on every push (`.github/workflows/ci.yml`'s `flatpak` job builds the manifest for real via `flathub-infra`'s container); `flatpak-builder` isn't installed locally in this dev environment, so it's not been run outside CI |
-| Windows | `cargo build --release` on a Windows host or CI runner                            | `packaging/windows/README.txt` covers device routing + the ffmpeg fallback for end users                                                                   |
+| Windows | `cargo build --release` on a Windows host or CI runner                            | `packaging/windows/README.txt` covers device routing + the ffmpeg fallback for end users                                                                                                                                                   |
 
 `.github/workflows/ci.yml` builds+tests on every push/PR, and on a
 `vX.Y.Z` tag push builds the RPM and a portable Windows zip and attaches

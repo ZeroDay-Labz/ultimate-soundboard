@@ -1,6 +1,6 @@
 [package]
 name = "ultimate_soundboard"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 description = "A cross-platform soundboard workspace with tabs, drag-and-drop imports, and routable audio output."
 license = "MIT"

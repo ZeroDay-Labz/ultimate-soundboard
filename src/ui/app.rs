@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use egui::RichText;
-use global_hotkey::hotkey::{Code, HotKey};
+use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use uuid::Uuid;
 
@@ -48,7 +48,7 @@ pub struct SoundboardApp {
     state: AppState,
     engine: Option<AudioEngine>,
     engine_error: Option<String>,
-    renaming_tab: Option<(usize, String)>,
+    renaming_tab: Option<tabs::TabRename>,
     dirty: bool,
     dirty_since: Option<Instant>,
     toasts: toast::Toasts,
@@ -73,6 +73,10 @@ pub struct SoundboardApp {
     /// every single frame.
     prewarmed_tab: Option<uuid::Uuid>,
     prewarmed_button_count: usize,
+    /// Pitch the current tab was last warmed at. Changing pitch produces
+    /// a different rendering, so the warm-up has to be redone or the next
+    /// click pays the vocoder pass it was supposed to have avoided.
+    prewarmed_pitch: i32,
     level_meter: meter::LevelMeter,
     last_meter_update: Option<Instant>,
     screenshot_frames: u32,
@@ -132,6 +136,7 @@ impl SoundboardApp {
             swf_job: None,
             prewarmed_tab: None,
             prewarmed_button_count: 0,
+            prewarmed_pitch: 0,
             level_meter: meter::LevelMeter::default(),
             last_meter_update: None,
             screenshot_frames: 0,
@@ -336,19 +341,29 @@ impl SoundboardApp {
     /// actually changed.
     fn prewarm_current_tab(&mut self) {
         let Some(tab) = self.state.tabs.get(self.state.current_tab) else { return };
-        if self.prewarmed_tab == Some(tab.id) && self.prewarmed_button_count == tab.buttons.len() {
+        let pitch_key = (tab.pitch * 100.0).round() as i32;
+        if self.prewarmed_tab == Some(tab.id)
+            && self.prewarmed_button_count == tab.buttons.len()
+            && self.prewarmed_pitch == pitch_key
+        {
             return;
         }
         self.prewarmed_tab = Some(tab.id);
         self.prewarmed_button_count = tab.buttons.len();
+        self.prewarmed_pitch = pitch_key;
 
         if let Some(engine) = &self.engine {
-            let paths = tab
+            let tab_semitones = crate::audio::pitch::ratio_to_semitones(tab.pitch);
+            let jobs = tab
                 .buttons
                 .iter()
                 .filter(|b| !b.missing_file && !b.file.is_empty())
-                .map(|b| PathBuf::from(&b.file));
-            engine.prewarm(paths);
+                .map(|b| {
+                    let semitones =
+                        crate::audio::pitch::ratio_to_semitones(b.pitch) + tab_semitones;
+                    (PathBuf::from(&b.file), semitones)
+                });
+            engine.prewarm(jobs);
         }
     }
 
@@ -594,7 +609,12 @@ impl SoundboardApp {
                 let volume = (btn.volume * tab.volume).clamp(0.0, 2.0);
                 let semitones = crate::audio::pitch::ratio_to_semitones(btn.pitch)
                     + crate::audio::pitch::ratio_to_semitones(tab.pitch);
-                self.play(board::PlayRequest { file: btn.file.clone(), volume, pitch_semitones: semitones });
+                self.play(board::PlayRequest {
+                    file: btn.file.clone(),
+                    volume,
+                    pitch_semitones: semitones,
+                    button_id: btn.id,
+                });
                 return;
             }
         }
@@ -636,6 +656,7 @@ impl SoundboardApp {
                 path: PathBuf::from(req.file),
                 volume: req.volume,
                 pitch_semitones: req.pitch_semitones,
+                button_id: req.button_id,
             });
         }
     }
@@ -906,7 +927,7 @@ impl SoundboardApp {
                         && ui
                             .button(RichText::new("⚠ hotkeys").color(super::theme::palette::YELLOW).small())
                             .on_hover_text(
-                                "System-wide hotkeys aren't available on this session, so Space (stop all) and per-button hotkeys only fire while this window is focused. Click to review your hotkeys.",
+                                "System-wide hotkeys aren't available on this session, so stop-all and per-button hotkeys only fire while this window is focused. Click to review your hotkeys.",
                             )
                             .clicked()
                     {
@@ -1152,15 +1173,18 @@ impl eframe::App for SoundboardApp {
             }
             let idx = self.state.current_tab.min(self.state.tabs.len().saturating_sub(1));
             let filter = self.search_filter.clone();
+            let default_button_size = self.state.default_button_size;
             // Everything the board asks for is collected while `tab` is
             // borrowed and acted on after, so the handlers below are free
             // to touch `self` again.
             let mut play_request = None;
+            let mut mix_update = None;
             let mut board_changed = false;
 
             if let Some(tab) = self.state.tabs.get_mut(idx) {
-                let result = board::show(ui, tab, &playing, &filter);
+                let result = board::show(ui, tab, &playing, &filter, default_button_size);
                 play_request = result.play;
+                mix_update = result.mix_update;
                 board_changed = result.changed;
                 hotkeys_changed = result.hotkeys_changed;
 
@@ -1173,10 +1197,40 @@ impl eframe::App for SoundboardApp {
                         deleted_button = Some((tab.id, pos, button));
                     }
                 }
+
+                if let Some(id) = result.duplicate {
+                    if let Some(pos) = tab.buttons.iter().position(|b| b.id == id) {
+                        let mut copy = tab.buttons[pos].clone();
+                        // A fresh identity, and no hotkey: the original
+                        // keeps the binding, since two buttons claiming
+                        // one combo silently leaves the second dead.
+                        copy.id = Uuid::new_v4();
+                        copy.hotkey = None;
+                        copy.x += 16;
+                        copy.y += 16;
+                        tab.buttons.insert(pos + 1, copy);
+                        board_changed = true;
+                    }
+                }
             }
 
             if let Some(play) = play_request {
                 self.play(play);
+            }
+            // Push slider changes onto sound that is already playing, so
+            // the tile's volume and pitch act on it live instead of only
+            // applying the next time it's triggered.
+            if let Some(update) = mix_update {
+                if let Some(engine) = &self.engine {
+                    engine.set_button_gain(update.button_id, update.volume);
+                    if !update.file.is_empty() {
+                        engine.retune_button(
+                            update.button_id,
+                            PathBuf::from(update.file),
+                            update.semitones,
+                        );
+                    }
+                }
             }
             if board_changed {
                 self.mark_dirty();
@@ -1222,21 +1276,37 @@ impl eframe::App for SoundboardApp {
 /// backend, since Wayland's security model doesn't let apps observe key
 /// events while unfocused. When it's unavailable we fall back to the
 /// in-window binding above and tell the user why in the top bar.
+/// System-wide stop-all combo.
+///
+/// Deliberately *not* a bare Space. Registering an unmodified key as a
+/// global hotkey takes a display-wide grab on it (an `XGrabKey` on X11),
+/// which means the key stops being delivered to anyone else -- including
+/// this app's own text fields, and including every other program running
+/// on the desktop. That's what made it impossible to type a space when
+/// renaming a tab or a tile, and it was quietly eating the spacebar
+/// system-wide the whole time the app was open.
+///
+/// Space alone still stops everything while the window is focused; that
+/// path goes through egui's normal keyboard input and grabs nothing.
+pub const GLOBAL_STOP_LABEL: &str = "Ctrl+Shift+Space";
+
 fn setup_global_space_hotkey() -> (Option<GlobalHotKeyManager>, Option<u32>, bool) {
     let manager = match GlobalHotKeyManager::new() {
         Ok(m) => m,
         Err(e) => {
-            log::warn!("global hotkey manager unavailable ({e}); Space will only work while focused");
+            log::warn!("global hotkey manager unavailable ({e}); stop-all will only work while focused");
             return (None, None, false);
         }
     };
 
-    let hotkey = HotKey::new(None, Code::Space);
+    let hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::Space);
     let id = hotkey.id();
     match manager.register(hotkey) {
         Ok(()) => (Some(manager), Some(id), true),
         Err(e) => {
-            log::warn!("could not register global Space hotkey ({e}); Space will only work while focused");
+            log::warn!(
+                "could not register global {GLOBAL_STOP_LABEL} hotkey ({e}); stop-all will only work while focused"
+            );
             (None, None, false)
         }
     }

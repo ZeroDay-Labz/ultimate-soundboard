@@ -8,6 +8,7 @@ use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, StreamTrait};
 use crossbeam_channel::{select, unbounded, Receiver, Sender, TryRecvError};
 use lru::LruCache;
+use uuid::Uuid;
 
 use super::decode::{self, Decoded};
 use super::devices;
@@ -28,6 +29,16 @@ pub struct PlayJob {
     pub path: PathBuf,
     pub volume: f32,
     pub pitch_semitones: f32,
+    /// Which button triggered this, so its sliders can keep acting on the
+    /// sound after it has started (see `set_button_gain`/`retune_button`).
+    pub button_id: Uuid,
+}
+
+/// Re-render a sounding voice at a new pitch and crossfade into it.
+struct RetuneJob {
+    button_id: Uuid,
+    path: PathBuf,
+    semitones: f32,
 }
 
 // Play and prewarm ride on *separate* channels rather than one job enum,
@@ -40,6 +51,23 @@ pub struct PlayJob {
 // worth of background work. Two channels let the workers always serve a
 // click first (see `decode_worker`).
 
+/// Samples spent crossfading from the old rendering to a retuned one.
+/// Long enough to hide the phase discontinuity a phase vocoder leaves
+/// when you splice two renderings together, short enough that the pitch
+/// change still feels immediate -- about 5ms at 48kHz.
+const RETUNE_FADE: usize = 256;
+
+/// Per-sample gain smoothing coefficient. Jumping the gain in one step
+/// while audio is running produces zipper noise on every slider move, so
+/// the voice glides to its target instead.
+const GAIN_GLIDE: f32 = 0.002;
+
+/// Faster glide used when a voice is being stopped. Cutting samples dead
+/// mid-waveform is a step discontinuity, which speakers reproduce as an
+/// audible click -- mashing Space on a busy board made the whole board
+/// pop. ~15ms is short enough to still feel instant.
+const RELEASE_GLIDE: f32 = 0.01;
+
 struct Voice {
     left: Vec<f32>,
     right: Vec<f32>,
@@ -47,11 +75,52 @@ struct Voice {
     /// The button's file path, as given to `PlayJob` -- used only for the
     /// now-playing UI indicator (`playing_paths`), never for playback.
     source: String,
+    /// The button that started this voice. Volume and pitch are applied
+    /// live by looking voices up with it, rather than being baked into
+    /// the samples at trigger time.
+    button_id: Uuid,
+    gain: f32,
+    target_gain: f32,
+    semitones: f32,
+    /// The rendering being faded out of, during a retune.
+    fade_from: Option<(Vec<f32>, Vec<f32>)>,
+    fade_pos: usize,
+    /// Voice is releasing towards silence and should be dropped once it
+    /// gets there.
+    stopping: bool,
 }
 
-type CacheKey = (PathBuf, u64, u64);
+impl Voice {
+    /// Sample pair at the current position, blended with the outgoing
+    /// rendering while a retune crossfade is in flight.
+    fn sample(&self, offset: usize) -> (f32, f32) {
+        let i = self.pos + offset;
+        let (mut l, mut r) = (self.left[i], self.right[i]);
 
-fn fingerprint(path: &Path) -> CacheKey {
+        if let Some((old_l, old_r)) = &self.fade_from {
+            let t = ((self.fade_pos + offset) as f32 / RETUNE_FADE as f32).clamp(0.0, 1.0);
+            if i < old_l.len() {
+                l = old_l[i] * (1.0 - t) + l * t;
+                r = old_r[i] * (1.0 - t) + r * t;
+            }
+        }
+        (l, r)
+    }
+}
+
+/// Path + mtime + size + pitch. Pitch is part of the key because a
+/// shifted rendering is cached alongside the raw one: the phase vocoder
+/// costs ~50ms per 3s clip in release (and over a second in a debug
+/// build), and it used to run on *every* play of a pitched button.
+type CacheKey = (PathBuf, u64, u64, i32);
+
+/// Quantized so slider values that round to the same hundredth of a
+/// semitone share a cache entry instead of each rendering afresh.
+fn pitch_key(semitones: f32) -> i32 {
+    (semitones * 100.0).round() as i32
+}
+
+fn fingerprint(path: &Path, semitones: f32) -> CacheKey {
     match std::fs::metadata(path) {
         Ok(meta) => {
             let mtime = meta
@@ -60,9 +129,9 @@ fn fingerprint(path: &Path) -> CacheKey {
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_nanos() as u64)
                 .unwrap_or(0);
-            (path.to_path_buf(), mtime, meta.len())
+            (path.to_path_buf(), mtime, meta.len(), pitch_key(semitones))
         }
-        Err(_) => (path.to_path_buf(), 0, 0),
+        Err(_) => (path.to_path_buf(), 0, 0, pitch_key(semitones)),
     }
 }
 
@@ -97,13 +166,14 @@ impl PeakMeter {
     }
 }
 
-/// Owns the output stream and the decode/mix pipeline. `stop_all()` just
-/// clears the voice list, so it's instant regardless of how much is
-/// queued up decoding -- this is what makes the global Space-bar stop
+/// Owns the output stream and the decode/mix pipeline. `stop_all()` only
+/// touches voices that already exist, so it's instant regardless of how
+/// much is queued up decoding -- this is what makes the Space-bar stop
 /// reliable no matter how many buttons were just mashed.
 pub struct AudioEngine {
     play_tx: Sender<PlayJob>,
-    prewarm_tx: Sender<PathBuf>,
+    prewarm_tx: Sender<(PathBuf, f32)>,
+    retune_tx: Sender<RetuneJob>,
     voices: Arc<Mutex<Vec<Voice>>>,
     master_gain: Arc<Mutex<f32>>,
     peak: Arc<PeakMeter>,
@@ -130,7 +200,8 @@ impl AudioEngine {
         stream.play().context("starting output stream")?;
 
         let (play_tx, play_rx): (Sender<PlayJob>, Receiver<PlayJob>) = unbounded();
-        let (prewarm_tx, prewarm_rx): (Sender<PathBuf>, Receiver<PathBuf>) = unbounded();
+        let (prewarm_tx, prewarm_rx): (Sender<(PathBuf, f32)>, Receiver<(PathBuf, f32)>) = unbounded();
+        let (retune_tx, retune_rx): (Sender<RetuneJob>, Receiver<RetuneJob>) = unbounded();
 
         // One cache behind a mutex, shared by every worker. Previously each
         // worker built its own `DecodeCache`, so with two workers a sound
@@ -142,12 +213,22 @@ impl AudioEngine {
         for _ in 0..WORKER_COUNT {
             let play_rx = play_rx.clone();
             let prewarm_rx = prewarm_rx.clone();
+            let retune_rx = retune_rx.clone();
             let voices = voices.clone();
             let cache = cache.clone();
-            thread::spawn(move || decode_worker(play_rx, prewarm_rx, voices, cache));
+            thread::spawn(move || decode_worker(play_rx, prewarm_rx, retune_rx, voices, cache));
         }
 
-        Ok(Self { play_tx, prewarm_tx, voices, master_gain, peak, stream, device_name: resolved_name })
+        Ok(Self {
+            play_tx,
+            prewarm_tx,
+            retune_tx,
+            voices,
+            master_gain,
+            peak,
+            stream,
+            device_name: resolved_name,
+        })
     }
 
     /// Enqueues a play job. Never blocks the caller (UI thread) on decode
@@ -162,19 +243,53 @@ impl AudioEngine {
     /// already fresh in cache almost instantly). Call this whenever the
     /// visible tab changes so its buttons are warm by the time the user
     /// actually clicks one.
-    pub fn prewarm(&self, paths: impl IntoIterator<Item = PathBuf>) {
-        for path in paths {
-            if self.prewarm_tx.send(path).is_err() {
+    pub fn prewarm(&self, jobs: impl IntoIterator<Item = (PathBuf, f32)>) {
+        for job in jobs {
+            if self.prewarm_tx.send(job).is_err() {
                 break;
             }
         }
     }
 
-    /// Stops every currently-playing sound immediately. Bound to the
+    /// Applies a button's volume to anything it already has sounding.
+    ///
+    /// Cheap enough to call on every slider frame: it only touches the
+    /// voice's target gain, which the callback glides towards, so there
+    /// is no re-render and no zipper noise.
+    pub fn set_button_gain(&self, button_id: Uuid, gain: f32) {
+        if let Ok(mut voices) = self.voices.lock() {
+            for v in voices.iter_mut().filter(|v| v.button_id == button_id) {
+                v.target_gain = gain.clamp(0.0, 2.0);
+            }
+        }
+    }
+
+    /// Re-pitches anything this button already has sounding.
+    ///
+    /// Unlike gain this needs the clip re-rendered, so it goes to the
+    /// worker pool rather than being applied inline.
+    pub fn retune_button(&self, button_id: Uuid, path: PathBuf, semitones: f32) {
+        let needed = self
+            .voices
+            .lock()
+            .map(|v| v.iter().any(|v| v.button_id == button_id))
+            .unwrap_or(false);
+        if !needed {
+            return;
+        }
+        let _ = self.retune_tx.send(RetuneJob { button_id, path, semitones });
+    }
+
+    /// Releases every currently-playing sound. Bound to the
     /// global Space hotkey. Does not touch the decode queue, so sounds
     /// already in flight when Space is pressed just won't produce a voice.
     pub fn stop_all(&self) {
-        self.voices.lock().unwrap().clear();
+        if let Ok(mut voices) = self.voices.lock() {
+            for v in voices.iter_mut() {
+                v.stopping = true;
+                v.target_gain = 0.0;
+            }
+        }
     }
 
     pub fn set_master_gain(&self, gain: f32) {
@@ -256,7 +371,7 @@ impl DecodeCache {
 /// it once; that's rare, harmless, and much cheaper than the contention
 /// a decode-under-lock would cause.
 fn decode_cached(cache: &Mutex<DecodeCache>, path: &Path) -> Option<Arc<Decoded>> {
-    let key = fingerprint(path);
+    let key = fingerprint(path, 0.0);
     if let Some(hit) = cache.lock().unwrap().get(&key) {
         return Some(hit);
     }
@@ -269,9 +384,32 @@ fn decode_cached(cache: &Mutex<DecodeCache>, path: &Path) -> Option<Arc<Decoded>
     }
 }
 
+/// The clip rendered at `semitones`, cached like the raw decode.
+///
+/// Without this, every play of a pitched button re-ran the phase vocoder
+/// over the whole clip before a single sample reached the speakers. That
+/// is what made pitched buttons feel broken: the cost is paid once per
+/// (file, pitch) now, and prewarming pays it before the first click.
+fn shifted_cached(cache: &Mutex<DecodeCache>, path: &Path, semitones: f32) -> Option<Arc<Decoded>> {
+    if semitones.abs() < 0.01 {
+        return decode_cached(cache, path);
+    }
+
+    let key = fingerprint(path, semitones);
+    if let Some(hit) = cache.lock().unwrap().get(&key) {
+        return Some(hit);
+    }
+
+    let raw = decode_cached(cache, path)?;
+    let (left, right) =
+        pitch::shift_stereo(&raw.left, &raw.right, semitones, decode::TARGET_SR as f32);
+    Some(cache.lock().unwrap().put(key, Decoded { left, right }))
+}
+
 fn decode_worker(
     play_rx: Receiver<PlayJob>,
-    prewarm_rx: Receiver<PathBuf>,
+    prewarm_rx: Receiver<(PathBuf, f32)>,
+    retune_rx: Receiver<RetuneJob>,
     voices: Arc<Mutex<Vec<Voice>>>,
     cache: Arc<Mutex<DecodeCache>>,
 ) {
@@ -291,6 +429,17 @@ fn decode_worker(
             Err(TryRecvError::Empty) => {}
         }
 
+        // Retunes are ahead of prewarm too: they're a response to a live
+        // slider, so they need to land while the user is still listening.
+        match retune_rx.try_recv() {
+            Ok(job) => {
+                handle_retune(job, &voices, &cache);
+                continue;
+            }
+            Err(TryRecvError::Disconnected) => return,
+            Err(TryRecvError::Empty) => {}
+        }
+
         // Nothing to play right now, so block until either channel has
         // work rather than spinning.
         select! {
@@ -298,10 +447,17 @@ fn decode_worker(
                 Ok(job) => handle_play(job, &voices, &cache),
                 Err(_) => return,
             },
+            recv(retune_rx) -> msg => match msg {
+                Ok(job) => handle_retune(job, &voices, &cache),
+                Err(_) => return,
+            },
             recv(prewarm_rx) -> msg => match msg {
-                Ok(path) => {
+                Ok((path, semitones)) => {
                     if path.exists() {
-                        decode_cached(&cache, &path);
+                        // Warms the *pitched* rendering, not just the raw
+                        // decode: a pitched button whose vocoder pass
+                        // hasn't been done yet still stalls on first click.
+                        shifted_cached(&cache, &path, semitones);
                     }
                 }
                 Err(_) => return,
@@ -316,24 +472,68 @@ fn handle_play(job: PlayJob, voices: &Mutex<Vec<Voice>>, cache: &Mutex<DecodeCac
         return;
     }
 
-    let Some(decoded) = decode_cached(cache, &job.path) else { return };
+    let Some(decoded) = shifted_cached(cache, &job.path, job.pitch_semitones) else { return };
 
-    let (left, right) = if job.pitch_semitones.abs() > 0.01 {
-        pitch::shift_stereo(&decoded.left, &decoded.right, job.pitch_semitones, decode::TARGET_SR as f32)
-    } else {
-        (decoded.left.clone(), decoded.right.clone())
-    };
-
-    let volume = job.volume.clamp(0.0, 2.0);
-    let left: Vec<f32> = left.iter().map(|s| s * volume).collect();
-    let right: Vec<f32> = right.iter().map(|s| s * volume).collect();
-
-    if left.is_empty() {
+    if decoded.left.is_empty() {
         return;
     }
 
+    // Volume is *not* baked into the samples any more -- it lives on the
+    // voice so the button's slider keeps working on a sound that is
+    // already playing.
+    let gain = job.volume.clamp(0.0, 2.0);
     let source = job.path.to_string_lossy().to_string();
-    voices.lock().unwrap().push(Voice { left, right, pos: 0, source });
+
+    voices.lock().unwrap().push(Voice {
+        left: decoded.left.clone(),
+        right: decoded.right.clone(),
+        pos: 0,
+        source,
+        button_id: job.button_id,
+        gain,
+        target_gain: gain,
+        semitones: job.pitch_semitones,
+        fade_from: None,
+        fade_pos: 0,
+        stopping: false,
+    });
+}
+
+/// Swaps a sounding voice over to a rendering at a new pitch, keeping its
+/// playback position.
+///
+/// Position carries over directly because the shift is duration
+/// preserving: sample N in the retuned rendering is the same instant of
+/// the clip as sample N in the old one. The crossfade covers the phase
+/// discontinuity between two independent vocoder runs, which would
+/// otherwise be an audible click.
+fn handle_retune(job: RetuneJob, voices: &Mutex<Vec<Voice>>, cache: &Mutex<DecodeCache>) {
+    let matches_any = voices
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|v| v.button_id == job.button_id && pitch_key(v.semitones) != pitch_key(job.semitones));
+    if !matches_any {
+        return;
+    }
+
+    let Some(decoded) = shifted_cached(cache, &job.path, job.semitones) else { return };
+
+    let mut voices = voices.lock().unwrap();
+    for v in voices.iter_mut() {
+        if v.button_id != job.button_id || pitch_key(v.semitones) == pitch_key(job.semitones) {
+            continue;
+        }
+        if v.pos >= decoded.left.len() {
+            continue;
+        }
+        let old = (std::mem::take(&mut v.left), std::mem::take(&mut v.right));
+        v.left = decoded.left.clone();
+        v.right = decoded.right.clone();
+        v.semitones = job.semitones;
+        v.fade_from = Some(old);
+        v.fade_pos = 0;
+    }
 }
 
 fn build_stream(
@@ -415,11 +615,31 @@ where
                             return false;
                         }
                         let n = remaining.min(frames);
+                        let glide = if v.stopping { RELEASE_GLIDE } else { GAIN_GLIDE };
                         for f in 0..n {
-                            mix[f * 2] += v.left[v.pos + f];
-                            mix[f * 2 + 1] += v.right[v.pos + f];
+                            // Glide rather than jump, so moving a volume
+                            // slider under a playing sound doesn't step
+                            // the gain and buzz.
+                            v.gain += (v.target_gain - v.gain) * glide;
+                            let (l, r) = v.sample(f);
+                            mix[f * 2] += l * v.gain;
+                            mix[f * 2 + 1] += r * v.gain;
                         }
                         v.pos += n;
+
+                        // Retire a released voice once it's inaudible.
+                        if v.stopping && v.gain < 0.0005 {
+                            return false;
+                        }
+
+                        if v.fade_from.is_some() {
+                            v.fade_pos += n;
+                            if v.fade_pos >= RETUNE_FADE {
+                                v.fade_from = None;
+                                v.fade_pos = 0;
+                            }
+                        }
+
                         v.pos < v.left.len()
                     });
                 }
