@@ -28,18 +28,25 @@ pub struct SoundButtonResult {
 /// hotkey, delete) -- mirrors `sound_button.py`'s behavior. `progress` is
 /// `Some(0.0..=1.0)` while the button's file has an active voice, driving
 /// both the glow and the playback sweep along the bottom edge.
+/// `matches_filter` is false only for a tile the active search filter
+/// excludes in free-form layout, where tiles are dimmed in place instead
+/// of being hidden (moving them would rearrange a hand-built board).
+/// Such a tile is inert: it can't be clicked, played or dragged, so a
+/// filtered-out button can't be triggered by accident.
 pub fn show(
     ui: &mut Ui,
     rect: Rect,
     model: &mut ButtonModel,
     edit_mode: bool,
     progress: Option<f32>,
+    matches_filter: bool,
 ) -> SoundButtonResult {
     let is_playing = progress.is_some();
     let mut result = SoundButtonResult::default();
 
     let id = Id::new(("sound_button", model.id));
-    let response = ui.interact(rect, id, Sense::click_and_drag());
+    let sense = if matches_filter { Sense::click_and_drag() } else { Sense::hover() };
+    let response = ui.interact(rect, id, sense);
 
     let resize_zone = Rect::from_min_size(
         Pos2::new(rect.right() - RESIZE_HANDLE, rect.bottom() - RESIZE_HANDLE),
@@ -109,6 +116,25 @@ pub fn show(
     };
 
     painter.rect(rect, 8.0, bg, border, StrokeKind::Inside);
+
+    // Top-face gradient: a key cap catches more light along its upper
+    // edge. Drawn as a few translucent bands rather than a real gradient,
+    // which epaint has no primitive for.
+    if !pressed_preview(&response, edit_mode) {
+        let bands = 4;
+        let band_h = (rect.height() * 0.42) / bands as f32;
+        for i in 0..bands {
+            let a = 16 - i * 4;
+            if a <= 0 {
+                continue;
+            }
+            let band = Rect::from_min_size(
+                Pos2::new(rect.left() + 1.0, rect.top() + 1.0 + i as f32 * band_h),
+                Vec2::new(rect.width() - 2.0, band_h),
+            );
+            painter.rect_filled(band, 0.0, Color32::from_white_alpha(a as u8));
+        }
+    }
 
     // Bevel: a light top edge and dark bottom edge, the cheap trick that
     // makes a flat rectangle read as a physical, pressable key rather
@@ -216,7 +242,14 @@ pub fn show(
         };
         painter.layout_job(job)
     };
-    let text_pos = label_rect.center() - galley.size() / 2.0;
+    // `job.halign` already centers each row on the anchor x, so only the
+    // vertical offset is applied here. Subtracting half the width as well
+    // double-centers it and shoves every label half its own width off the
+    // left edge of the tile, where it gets clipped mid-word.
+    let text_pos = Pos2::new(
+        label_rect.center().x,
+        label_rect.center().y - galley.size().y / 2.0,
+    );
     painter.galley(text_pos, galley, text_color);
 
     // Hotkey badge, so an assigned trigger is visible on the face of the
@@ -245,6 +278,13 @@ pub fn show(
             Pos2::new(track.left() + track.width() * p.clamp(0.0, 1.0), track.max.y),
         );
         painter.rect_filled(filled, 1.25, super::theme::palette::MAUVE);
+    }
+
+    // Scrim for a tile the search filter excludes. Painted over the
+    // finished tile so artwork, emoji and label all recede together --
+    // the matches stay at full brightness and read as the answer.
+    if !matches_filter {
+        painter.rect_filled(rect, 8.0, Color32::from_black_alpha(165));
     }
 
     if model.missing_file {
@@ -405,6 +445,12 @@ fn show_context_menu(response: &egui::Response, edit_mode: bool, id: Id, model: 
             ui.close();
         }
     });
+}
+
+/// Whether the tile should be drawn in its pressed state -- the top-face
+/// highlight is skipped then, so the key reads as pushed in.
+fn pressed_preview(response: &egui::Response, edit_mode: bool) -> bool {
+    response.is_pointer_button_down_on() && !edit_mode
 }
 
 /// Rec. 601 perceived luminance, used only to decide light-vs-dark label

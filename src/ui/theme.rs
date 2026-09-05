@@ -25,6 +25,32 @@ pub mod palette {
     pub const YELLOW: Color32 = Color32::from_rgb(0xf9, 0xe2, 0xaf);
     pub const RED: Color32 = Color32::from_rgb(0xf3, 0x8b, 0xa8);
 
+    // ---- rack-unit tokens ----
+    // The chrome is painted to read as a piece of rack-mounted hardware:
+    // metal faces with a vertical gradient, etched labels, and LED-style
+    // indicators. These are the raw colors; `super::rack_panel` and
+    // `super::engraved` do the actual drawing.
+
+    /// Top and bottom of the panel-face gradient. The spread is
+    /// deliberately narrow -- a strong gradient reads as a cheap glossy
+    /// web button, a subtle one reads as brushed metal.
+    pub const PANEL_TOP: Color32 = Color32::from_rgb(0x3a, 0x3c, 0x52);
+    pub const PANEL_BOTTOM: Color32 = Color32::from_rgb(0x1f, 0x20, 0x2f);
+    /// Hairlines along a panel's top and bottom edges, which is what sells
+    /// the illusion of a physical bevelled face.
+    pub const PANEL_HILIGHT: Color32 = Color32::from_rgb(0x50, 0x52, 0x6b);
+    pub const PANEL_SHADOW: Color32 = Color32::from_rgb(0x14, 0x14, 0x1e);
+    /// Recessed area (meter wells, control sub-panels) -- darker than the
+    /// face so insets read as cut into it.
+    pub const RECESS: Color32 = Color32::from_rgb(0x15, 0x15, 0x20);
+
+    pub const LED_GREEN: Color32 = Color32::from_rgb(0x53, 0xe0, 0x8a);
+    pub const LED_AMBER: Color32 = Color32::from_rgb(0xf5, 0xc2, 0x4b);
+    pub const LED_RED: Color32 = Color32::from_rgb(0xff, 0x5c, 0x5c);
+    /// Unlit segment/indicator -- visible as a dark well so the meter
+    /// still reads as a row of LEDs when nothing is playing.
+    pub const LED_OFF: Color32 = Color32::from_rgb(0x25, 0x27, 0x35);
+
     /// One-click fills for the tile color picker. Deliberately dark and
     /// muted rather than the bright accent hues above: these are used as
     /// full-tile backgrounds behind light label text, so they need to sit
@@ -108,7 +134,66 @@ pub fn apply(ctx: &Context) {
     });
 }
 
-/// A soft glow color for the now-playing pulse ring, matching the accent.
-pub fn playing_glow() -> Rgba {
-    Rgba::from(MAUVE)
+/// Builds a metal panel face: a vertical gradient with a light hairline
+/// along the top edge and a dark one along the bottom.
+///
+/// Returns a `Shape` rather than painting directly because a panel's real
+/// height isn't known until its contents have been laid out -- inside a
+/// top panel, `ui.max_rect()` is the entire remaining window, so painting
+/// eagerly smears the gradient across the whole app. Callers reserve an
+/// index with `painter.add(Shape::Noop)` before adding content and
+/// `painter.set(...)` this shape into it afterwards, which also puts it
+/// behind the widgets.
+///
+/// egui has no gradient primitive, so the gradient is a stack of
+/// horizontal slices. `STEPS` is low on purpose -- across a ~30px toolbar
+/// the banding isn't visible, and this runs every frame.
+pub fn rack_panel_shape(rect: egui::Rect) -> egui::Shape {
+    const STEPS: usize = 12;
+    if rect.height() <= 0.0 || rect.width() <= 0.0 {
+        return egui::Shape::Noop;
+    }
+
+    let top = Rgba::from(PANEL_TOP);
+    let bottom = Rgba::from(PANEL_BOTTOM);
+    let step_h = rect.height() / STEPS as f32;
+    let mut shapes = Vec::with_capacity(STEPS + 2);
+
+    for i in 0..STEPS {
+        let t = i as f32 / (STEPS - 1).max(1) as f32;
+        let color = Color32::from(top * (1.0 - t) + bottom * t);
+        let slice = egui::Rect::from_min_size(
+            egui::pos2(rect.left(), rect.top() + i as f32 * step_h),
+            // Overdraw by half a pixel so slices can't leave seams when
+            // the panel height doesn't divide evenly.
+            egui::vec2(rect.width(), step_h + 0.5),
+        );
+        shapes.push(egui::Shape::rect_filled(slice, 0.0, color));
+    }
+
+    shapes.push(egui::Shape::line_segment(
+        [rect.left_top(), rect.right_top()],
+        Stroke::new(1.0, PANEL_HILIGHT),
+    ));
+    shapes.push(egui::Shape::line_segment(
+        [rect.left_bottom(), rect.right_bottom()],
+        Stroke::new(1.0, PANEL_SHADOW),
+    ));
+
+    egui::Shape::Vec(shapes)
+}
+
+/// Draws etched/engraved text: a dark copy offset one pixel down, with
+/// the real text over it. Reads as stamped into the panel rather than
+/// printed on top of it.
+pub fn engraved(
+    painter: &egui::Painter,
+    pos: egui::Pos2,
+    align: egui::Align2,
+    text: &str,
+    font: egui::FontId,
+    color: Color32,
+) {
+    painter.text(pos + egui::vec2(0.0, 1.0), align, text, font.clone(), PANEL_SHADOW);
+    painter.text(pos, align, text, font, color);
 }

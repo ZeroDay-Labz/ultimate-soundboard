@@ -50,6 +50,24 @@ fn prefer_x11_for_dnd_and_hotkeys() {
 #[cfg(not(target_os = "linux"))]
 fn prefer_x11_for_dnd_and_hotkeys() {}
 
+/// The same icon the RPM and Flatpak install for the desktop entry,
+/// compiled in so the running window and its taskbar entry match the
+/// launcher instead of falling back to the toolkit's generic default.
+fn window_icon() -> Option<egui::IconData> {
+    const ICON_PNG: &[u8] = include_bytes!("../packaging/linux/icon.png");
+    match image::load_from_memory(ICON_PNG) {
+        Ok(img) => {
+            let img = img.to_rgba8();
+            let (width, height) = (img.width(), img.height());
+            Some(egui::IconData { rgba: img.into_raw(), width, height })
+        }
+        Err(e) => {
+            log::warn!("could not decode bundled window icon: {e}");
+            None
+        }
+    }
+}
+
 fn main() -> eframe::Result {
     // Default to info-level so the app's own diagnostic logging (decode
     // failures, unrecognized drops, importer errors) is visible to a user
@@ -59,13 +77,15 @@ fn main() -> eframe::Result {
 
     prefer_x11_for_dnd_and_hotkeys();
 
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Ultimate Soundboard")
-            .with_inner_size([1000.0, 680.0])
-            .with_min_inner_size([560.0, 360.0]),
-        ..Default::default()
-    };
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("Ultimate Soundboard")
+        .with_inner_size([1000.0, 680.0])
+        .with_min_inner_size([560.0, 360.0]);
+    if let Some(icon) = window_icon() {
+        viewport = viewport.with_icon(icon);
+    }
+
+    let options = eframe::NativeOptions { viewport, ..Default::default() };
 
     eframe::run_native(
         "Ultimate Soundboard",

@@ -103,12 +103,24 @@ pub fn show(
             let resp = ui.push_id(tab_id, |ui| ui.add(button)).inner;
             this_frame_rects.push((tab_id, resp.rect));
 
-            if let Some(c) = accent {
+            // Indicator lamp along the bottom edge: lit for the active tab,
+            // dimmed to a hint for the others. A tab with no accent colour
+            // still lights up, so "which board am I on" is readable at a
+            // glance rather than resting on egui's subtle selection fill.
+            let lamp = accent.unwrap_or(palette::LAVENDER);
+            let (thickness, color) = if is_current {
+                (3.0, lamp)
+            } else if accent.is_some() {
+                (2.0, lamp.gamma_multiply(0.45))
+            } else {
+                (0.0, lamp)
+            };
+            if thickness > 0.0 {
                 let underline_rect = egui::Rect::from_min_max(
-                    resp.rect.left_bottom() + egui::vec2(2.0, -2.0),
+                    resp.rect.left_bottom() + egui::vec2(2.0, -thickness),
                     resp.rect.right_bottom() + egui::vec2(-2.0, 0.0),
                 );
-                ui.painter().rect_filled(underline_rect, 1.0, c);
+                ui.painter().rect_filled(underline_rect, 1.0, color);
             }
             if being_dragged {
                 ui.painter().rect_stroke(resp.rect, 6.0, egui::Stroke::new(2.0, palette::LAVENDER), egui::StrokeKind::Outside);

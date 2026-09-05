@@ -30,7 +30,14 @@ proper cross-platform packaged app instead of a dev script.
 - **Global Stop** -- Space instantly stops every sound, system-wide on
   Windows/macOS/X11 (Wayland has no API for this -- see below).
 - **Per-button global hotkeys** -- trigger a specific sound while another
-  app (Discord, a softphone) has focus.
+  app (Discord, a softphone) has focus. The Hotkeys panel lists every
+  binding at once and flags duplicates, which otherwise fail silently
+  (only the first registration of a combo wins).
+- **Search** -- `Ctrl+F` filters the current board by label or file name.
+  Grid tabs compact down to the matches; free-form tabs dim the rest in
+  place so a hand-built layout never rearranges itself.
+- **Undo** -- deleting a tab asks first, and both tab and button deletes
+  can be reversed with `Ctrl+Z` or the Undo button on the toast.
 - **Audio output routing** -- pick a specific output device so the board
   plays into a virtual cable/Voicemeeter input on Windows, or shows up as a
   routable node in `pavucontrol`/`qpwgraph`/`helvum` on Linux (PipeWire).

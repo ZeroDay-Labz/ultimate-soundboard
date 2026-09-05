@@ -32,6 +32,18 @@ struct CloneJob {
 
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 
+/// The last destructive action, kept so it can be reversed.
+///
+/// Deleting a tab used to take every button in it with no confirmation
+/// and no way back -- on a scraped board that's a hundred-plus sounds
+/// gone, recoverable only by re-scraping. Single-level (only the most
+/// recent action) on purpose: it covers the misclick this exists for
+/// without turning board state into an undo stack.
+enum UndoAction {
+    Tab { index: usize, tab: TabModel },
+    Button { tab_id: Uuid, index: usize, button: ButtonModel },
+}
+
 pub struct SoundboardApp {
     state: AppState,
     engine: Option<AudioEngine>,
@@ -64,6 +76,21 @@ pub struct SoundboardApp {
     level_meter: meter::LevelMeter,
     last_meter_update: Option<Instant>,
     screenshot_frames: u32,
+    hotkeys_panel_open: bool,
+    /// Live search text for the current board. Not persisted -- a filter
+    /// that survived a restart would look like sounds had gone missing.
+    search_filter: String,
+    /// Set for one frame to move keyboard focus into the search field.
+    focus_search: bool,
+    undo: Option<UndoAction>,
+    /// Index of a tab awaiting delete confirmation.
+    pending_tab_delete: Option<usize>,
+    /// Whether the persisted `always_on_top` setting has been pushed to
+    /// the viewport yet. It can't be sent from `new()` -- there's no
+    /// viewport to command until the first frame -- and until this was
+    /// tracked, the level was only ever sent when the checkbox changed,
+    /// so the setting silently didn't survive a restart.
+    applied_startup_window_level: bool,
 }
 
 impl SoundboardApp {
@@ -108,6 +135,12 @@ impl SoundboardApp {
             level_meter: meter::LevelMeter::default(),
             last_meter_update: None,
             screenshot_frames: 0,
+            hotkeys_panel_open: false,
+            search_filter: String::new(),
+            focus_search: false,
+            undo: None,
+            pending_tab_delete: None,
+            applied_startup_window_level: false,
         };
         app.resync_button_hotkeys();
         app.apply_master_gain();
@@ -389,6 +422,112 @@ impl SoundboardApp {
         }
     }
 
+    /// Confirmation for deleting a tab, naming what's about to go.
+    fn tab_delete_dialog(&mut self, ctx: &egui::Context) {
+        let Some(index) = self.pending_tab_delete else { return };
+        let Some(tab) = self.state.tabs.get(index) else {
+            self.pending_tab_delete = None;
+            return;
+        };
+
+        let name = tab.name.clone();
+        let count = tab.buttons.len();
+        let mut confirmed = false;
+        let mut cancelled = false;
+
+        egui::Modal::new(egui::Id::new("confirm_tab_delete")).show(ctx, |ui| {
+            ui.set_max_width(380.0);
+            ui.heading("Delete tab?");
+            ui.add_space(6.0);
+            ui.label(match count {
+                0 => format!("\"{name}\" is empty."),
+                1 => format!("\"{name}\" holds 1 sound."),
+                n => format!("\"{name}\" holds {n} sounds."),
+            });
+            ui.label(
+                RichText::new(
+                    "The sound files on disk are left alone -- only this tab's buttons are removed.",
+                )
+                .small()
+                .color(super::theme::palette::SUBTEXT),
+            );
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() {
+                    cancelled = true;
+                }
+                if ui
+                    .button(RichText::new("Delete tab").color(super::theme::palette::RED))
+                    .clicked()
+                {
+                    confirmed = true;
+                }
+            });
+        });
+
+        if cancelled {
+            self.pending_tab_delete = None;
+        }
+        if confirmed {
+            self.pending_tab_delete = None;
+            self.delete_tab(index);
+        }
+    }
+
+    fn delete_tab(&mut self, index: usize) {
+        if self.state.tabs.len() <= 1 || index >= self.state.tabs.len() {
+            return;
+        }
+        let tab = self.state.tabs.remove(index);
+        let name = tab.name.clone();
+        if self.state.current_tab >= self.state.tabs.len() {
+            self.state.current_tab = self.state.tabs.len() - 1;
+        }
+        self.undo = Some(UndoAction::Tab { index, tab });
+        self.toasts.undoable(format!("Deleted tab \"{name}\""));
+        self.resync_button_hotkeys();
+        self.mark_dirty();
+    }
+
+    /// Puts back whatever the last destructive action removed.
+    fn apply_undo(&mut self) {
+        match self.undo.take() {
+            Some(UndoAction::Tab { index, tab }) => {
+                let name = tab.name.clone();
+                let at = index.min(self.state.tabs.len());
+                self.state.tabs.insert(at, tab);
+                self.state.current_tab = at;
+                self.resync_button_hotkeys();
+                self.mark_dirty();
+                self.toasts.success(format!("Restored tab \"{name}\""));
+            }
+            Some(UndoAction::Button { tab_id, index, button }) => {
+                let label = button.label.clone();
+                // Found by id rather than index: tabs can be reordered
+                // between the delete and the undo.
+                if let Some(tab) = self.state.tabs.iter_mut().find(|t| t.id == tab_id) {
+                    let at = index.min(tab.buttons.len());
+                    tab.buttons.insert(at, button);
+                    self.resync_button_hotkeys();
+                    self.mark_dirty();
+                    self.toasts.success(format!("Restored \"{label}\""));
+                } else {
+                    self.toasts.warning(format!("Can't restore \"{label}\" -- its tab is gone"));
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn apply_window_level(&self, ctx: &egui::Context) {
+        let level = if self.state.always_on_top {
+            egui::WindowLevel::AlwaysOnTop
+        } else {
+            egui::WindowLevel::Normal
+        };
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+    }
+
     fn ensure_wallpaper_texture(&mut self, ctx: &egui::Context) {
         let Some(path) = self.state.wallpaper.clone() else {
             self.wallpaper_texture = None;
@@ -517,14 +656,11 @@ impl SoundboardApp {
         if action.new_tab {
             self.new_tab(None);
         }
+        // Deleting a tab throws away every sound in it, so it asks first
+        // rather than acting on the click.
         if let Some(i) = action.delete {
             if self.state.tabs.len() > 1 && i < self.state.tabs.len() {
-                self.state.tabs.remove(i);
-                if self.state.current_tab >= self.state.tabs.len() {
-                    self.state.current_tab = self.state.tabs.len() - 1;
-                }
-                self.resync_button_hotkeys();
-                self.mark_dirty();
+                self.pending_tab_delete = Some(i);
             }
         }
         if let Some((from, to)) = action.reorder {
@@ -715,10 +851,23 @@ impl SoundboardApp {
         }
     }
 
+    /// The rack header: brand plate and grouped controls on the left,
+    /// master section on the right, tab strip below.
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::top("menu_bar").show(ui, |ui| {
-            ui.add_space(2.0);
+            // Reserve a slot for the panel face now and fill it in once the
+            // rows below have been laid out -- the header's real height
+            // isn't known until then.
+            let face = ui.painter().add(egui::Shape::Noop);
+            let full_width = ui.max_rect().x_range();
+
+            ui.add_space(4.0);
             ui.horizontal(|ui| {
+                self.brand_plate(ui);
+                ui.add_space(10.0);
+
+                // Grouped by what the actions do to your board, rather
+                // than one undifferentiated run of buttons.
                 if ui.button("➕ New Tab").clicked() {
                     self.new_tab(None);
                 }
@@ -736,9 +885,15 @@ impl SoundboardApp {
                     self.clone_dialog_open = true;
                 }
                 ui.separator();
+                if ui.button("⌨ Hotkeys").on_hover_text("See every button hotkey and spot conflicts").clicked() {
+                    self.hotkeys_panel_open = true;
+                }
                 if ui.button("⚙ Settings").clicked() {
                     self.settings_open = true;
                 }
+
+                ui.separator();
+                self.search_field(ui);
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // Keep status compact: a long sentence here competes
@@ -747,51 +902,132 @@ impl SoundboardApp {
                     if let Some(err) = &self.engine_error {
                         ui.label(RichText::new("⚠ audio").color(super::theme::palette::RED))
                             .on_hover_text(format!("Audio unavailable: {err}"));
-                    } else if !self.space_hotkey_is_global {
-                        ui.label(RichText::new("⚠ hotkeys").color(super::theme::palette::YELLOW).small())
+                    } else if !self.space_hotkey_is_global
+                        && ui
+                            .button(RichText::new("⚠ hotkeys").color(super::theme::palette::YELLOW).small())
                             .on_hover_text(
-                                "System-wide hotkeys aren't available on this session, so Space (stop all) and per-button hotkeys only fire while this window is focused.",
-                            );
-                    }
-
-                    ui.add_space(8.0);
-
-                    // Master strip, laid out right-to-left: meter, then
-                    // fader, then mute -- reads like the master section on
-                    // a mixer once you get to the right edge of the bar.
-                    self.level_meter.show(ui, egui::vec2(110.0, 12.0));
-                    ui.add_space(6.0);
-
-                    let mute_icon = if self.state.muted { "🔇" } else { "🔊" };
-                    let mute_text = if self.state.muted {
-                        RichText::new(mute_icon).color(super::theme::palette::RED)
-                    } else {
-                        RichText::new(mute_icon)
-                    };
-                    if ui.button(mute_text).on_hover_text("Mute / unmute").clicked() {
-                        self.state.muted = !self.state.muted;
-                        self.apply_master_gain();
-                        self.mark_dirty();
-                    }
-                    let mut volume = self.state.master_volume;
-                    let slider = egui::Slider::new(&mut volume, 0.0..=2.0).show_value(false);
-                    if ui
-                        .add_sized([90.0, 18.0], slider)
-                        .on_hover_text(format!("Master volume: {:.0}%", self.state.master_volume * 100.0))
-                        .changed()
+                                "System-wide hotkeys aren't available on this session, so Space (stop all) and per-button hotkeys only fire while this window is focused. Click to review your hotkeys.",
+                            )
+                            .clicked()
                     {
-                        self.state.master_volume = volume;
-                        self.apply_master_gain();
-                        self.mark_dirty();
+                        self.hotkeys_panel_open = true;
                     }
-                    ui.label(RichText::new("MASTER").color(super::theme::palette::SUBTEXT).small().monospace());
                 });
             });
 
             ui.add_space(4.0);
-            let action = tabs::show(ui, &mut self.state.tabs, self.state.current_tab, &mut self.renaming_tab);
-            self.apply_tabs_action(action);
+
+            // Tabs and the master strip share a row, with each side given
+            // an explicit width. Letting egui negotiate it is what made
+            // the master section collide with the toolbar above.
+            ui.horizontal(|ui| {
+                let avail = ui.available_width();
+                let master_w = super::master::WIDTH.min(avail * 0.6);
+                let tabs_w = (avail - master_w).max(120.0);
+
+                ui.allocate_ui_with_layout(
+                    egui::vec2(tabs_w, super::master::HEIGHT),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        let action = tabs::show(
+                            ui,
+                            &mut self.state.tabs,
+                            self.state.current_tab,
+                            &mut self.renaming_tab,
+                        );
+                        self.apply_tabs_action(action);
+                    },
+                );
+
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), super::master::HEIGHT),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        // Built right-to-left so the strip stays pinned to
+                        // the window edge; `master::show` lays its own
+                        // controls out in reading order within that.
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(master_w, super::master::HEIGHT),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                let result = super::master::show(
+                                    ui,
+                                    &self.level_meter,
+                                    &mut self.state.master_volume,
+                                    &mut self.state.muted,
+                                );
+                                if result.changed {
+                                    self.apply_master_gain();
+                                    self.mark_dirty();
+                                }
+                                if result.stop_all {
+                                    self.stop_all();
+                                }
+                            },
+                        );
+                    },
+                );
+            });
+
+            ui.add_space(3.0);
+
+            let face_rect = egui::Rect::from_x_y_ranges(full_width, ui.min_rect().y_range());
+            ui.painter().set(face, super::theme::rack_panel_shape(face_rect));
         });
+    }
+
+    /// Search box for the current board. A 157-button scraped tab is not
+    /// something you can scan by eye, and there was no way to find one
+    /// sound short of scrolling.
+    fn search_field(&mut self, ui: &mut egui::Ui) {
+        let resp = ui.add_sized(
+            egui::vec2(150.0, 20.0),
+            egui::TextEdit::singleline(&mut self.search_filter)
+                .hint_text("🔍 Find a sound")
+                .desired_width(150.0),
+        );
+
+        if self.focus_search {
+            self.focus_search = false;
+            resp.request_focus();
+        }
+
+        // Escape clears rather than just unfocusing: a filter left applied
+        // with the field unfocused looks like sounds have gone missing.
+        if resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.search_filter.clear();
+        }
+
+        if !self.search_filter.is_empty()
+            && ui
+                .small_button("✖")
+                .on_hover_text("Clear the search (Esc)")
+                .clicked()
+        {
+            self.search_filter.clear();
+        }
+    }
+
+    /// Etched name plate, the way a rack unit carries its model name.
+    fn brand_plate(&self, ui: &mut egui::Ui) {
+        let (rect, _resp) = ui.allocate_exact_size(egui::vec2(148.0, 24.0), egui::Sense::hover());
+        let painter = ui.painter_at(rect);
+
+        painter.rect_filled(rect, 3.0, super::theme::palette::RECESS);
+        painter.rect_stroke(
+            rect,
+            3.0,
+            egui::Stroke::new(1.0, super::theme::palette::PANEL_SHADOW),
+            egui::StrokeKind::Inside,
+        );
+        super::theme::engraved(
+            &painter,
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "ULTIMATE SOUNDBOARD",
+            egui::FontId::monospace(9.5),
+            super::theme::palette::LAVENDER,
+        );
     }
 }
 
@@ -812,8 +1048,27 @@ impl eframe::App for SoundboardApp {
             }
         }
 
-        if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
+        // Gated on nothing having keyboard focus. Without the guard, typing
+        // a space into any text field -- rename, clone URL, and now the
+        // search box -- stops every playing sound.
+        let typing = ctx.egui_wants_keyboard_input();
+
+        if !typing && ctx.input(|i| i.key_pressed(egui::Key::Space)) {
             self.stop_all();
+        }
+
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
+            self.focus_search = true;
+        }
+
+        // Ctrl+Z as well as the toast button: the toast can be missed or
+        // can expire, and this is the shortcut anyone will reach for.
+        if !typing
+            && self.undo.is_some()
+            && ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Z))
+        {
+            self.toasts.clear_undo();
+            self.apply_undo();
         }
 
         self.top_bar(ui);
@@ -831,11 +1086,25 @@ impl eframe::App for SoundboardApp {
                 self.wallpaper_texture = None;
             }
             if result.always_on_top_changed {
-                let level = if self.state.always_on_top { egui::WindowLevel::AlwaysOnTop } else { egui::WindowLevel::Normal };
-                ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+                self.apply_window_level(&ctx);
             }
             if result.changed {
                 self.mark_dirty();
+            }
+        }
+
+        if self.hotkeys_panel_open {
+            let mut open = self.hotkeys_panel_open;
+            super::hotkeys_panel::show(&ctx, &mut open, &self.state.tabs, self.space_hotkey_is_global);
+            self.hotkeys_panel_open = open;
+        }
+
+        // Deferred to the first frame rather than done in `new()`: there
+        // is no viewport to send a command to until the app is running.
+        if !self.applied_startup_window_level {
+            self.applied_startup_window_level = true;
+            if self.state.always_on_top {
+                self.apply_window_level(&ctx);
             }
         }
 
@@ -863,6 +1132,10 @@ impl eframe::App for SoundboardApp {
         self.prewarm_current_tab();
         self.show_drag_hover_overlay(&ctx);
 
+        // Declared out here so the undo offer can be raised after the
+        // panel closure has given back its borrow of `self`.
+        let mut deleted_button = None;
+
         egui::CentralPanel::default().show(ui, |ui| {
             if let Some((_, tex)) = &self.wallpaper_texture {
                 let rect = ui.max_rect();
@@ -878,20 +1151,45 @@ impl eframe::App for SoundboardApp {
                 self.new_tab(None);
             }
             let idx = self.state.current_tab.min(self.state.tabs.len().saturating_sub(1));
+            let filter = self.search_filter.clone();
+            // Everything the board asks for is collected while `tab` is
+            // borrowed and acted on after, so the handlers below are free
+            // to touch `self` again.
+            let mut play_request = None;
+            let mut board_changed = false;
+
             if let Some(tab) = self.state.tabs.get_mut(idx) {
-                let result = board::show(ui, tab, &playing);
-                if let Some(play) = result.play {
-                    self.play(play);
-                }
-                if result.stop_all {
-                    self.stop_all();
-                }
-                if result.changed {
-                    self.mark_dirty();
-                }
+                let result = board::show(ui, tab, &playing, &filter);
+                play_request = result.play;
+                board_changed = result.changed;
                 hotkeys_changed = result.hotkeys_changed;
+
+                // Removal happens here rather than in the board so the
+                // deleted button and its position survive long enough to
+                // be offered back as an undo.
+                if let Some(id) = result.delete {
+                    if let Some(pos) = tab.buttons.iter().position(|b| b.id == id) {
+                        let button = tab.buttons.remove(pos);
+                        deleted_button = Some((tab.id, pos, button));
+                    }
+                }
+            }
+
+            if let Some(play) = play_request {
+                self.play(play);
+            }
+            if board_changed {
+                self.mark_dirty();
             }
         });
+
+        if let Some((tab_id, index, button)) = deleted_button {
+            let label = button.label.clone();
+            self.undo = Some(UndoAction::Button { tab_id, index, button });
+            self.toasts.undoable(format!("Deleted \"{label}\""));
+            self.resync_button_hotkeys();
+            self.mark_dirty();
+        }
 
         if hotkeys_changed {
             self.resync_button_hotkeys();
@@ -899,7 +1197,11 @@ impl eframe::App for SoundboardApp {
 
         self.handle_drops(&ctx);
         self.poll_swf_job();
-        self.toasts.show(&ctx);
+        self.tab_delete_dialog(&ctx);
+
+        if self.toasts.show(&ctx) {
+            self.apply_undo();
+        }
         self.maybe_save();
 
         if self.dirty {
