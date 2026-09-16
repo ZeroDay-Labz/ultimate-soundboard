@@ -67,6 +67,14 @@ proper cross-platform packaged app instead of a dev script.
   are skipped, and they're named when they are; both are microphone codecs
   that essentially never appear in authored soundboards.
 
+  **Tiles keep the names off the original board.** Flash soundboards rarely
+  name their sounds, but they do draw a caption on every button, so the
+  ripper follows `DefineButtonSound` to the button, to the text drawn on it,
+  to the font's code table, and imports the sound as `THIS IS ANGEL` rather
+  than `Sound 24` -- which names the extracted files usefully too. Boards
+  that don't give us enough to go on still fall back to numbering, and the
+  import toast says how many names it recovered.
+
   The ripper reads each tag's code and length and only looks inside the
   handful of sound-related ones -- it never parses, let alone runs,
   ActionScript. There's no AS interpreter anywhere in this app, so a

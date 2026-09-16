@@ -3,6 +3,34 @@
 All notable changes to Ultimate Soundboard are recorded here. Versions
 follow [semantic versioning](https://semver.org/).
 
+## [0.2.1] - 2026-09-16
+
+### Added
+
+- **`.swf` imports keep the names off the original board.** Flash
+  soundboards almost never name their sounds -- `angel_v1.swf` sets no
+  `ExportAssets` symbol at all -- so every tile used to import as
+  "Sound 1", "Sound 2", ... The caption is in the file, four tags away:
+  `DefineButtonSound` -> `DefineButton2` -> `DefineText` -> the font's
+  glyph code table. The new `src/importers/swf_text.rs` walks that chain
+  and names the tile (and the extracted file) `THIS IS ANGEL` instead of
+  `Sound 24`. Resolves 86/86 buttons on the test board.
+- A caption wrapped onto two lines is joined with a space rather than run
+  together, so "HI THIS IS ANGEL" + "FROM SOC POLICE" imports as one
+  readable phrase.
+- A deliberately strict fallback for boards built from sprites rather than
+  buttons: a sprite is only labelled when it holds exactly one sound and
+  exactly one caption, since a wrong name is worse than a numbered one.
+- The import toast now reports how many sounds were named from the board,
+  so a board we couldn't read captions from is obvious rather than quietly
+  numbered.
+
+### Changed
+
+- Label precedence is now board caption, then `ExportAssets`/`SymbolClass`
+  symbol name, then the `Sound N` counter. The visible caption wins because
+  it's what someone looking at the original board would call the sound.
+
 ## [0.2.0] - 2026-09-15
 
 ### Added

@@ -9,6 +9,7 @@ use swf::{AudioCompression, SoundFormat};
 
 use super::ImportedButton;
 use super::swf_adpcm;
+use super::swf_text;
 
 pub struct SwfRipResult {
     pub tab_name: String,
@@ -21,6 +22,9 @@ pub struct SwfRipResult {
     /// Counted separately so a write failure can't masquerade as an
     /// unsupported codec.
     pub failed: usize,
+    /// How many extracted sounds got their name from the board itself rather
+    /// than a "Sound N" counter.
+    pub labelled: usize,
 }
 
 // Tag codes we care about. Everything else is skipped without being parsed
@@ -67,17 +71,23 @@ pub fn extract_sounds(path: &Path) -> Result<SwfRipResult> {
     let mut names: HashMap<u16, String> = HashMap::new();
     collect_names(&swf_buf.data, version, 0, &mut names);
 
+    // What each sound is called on the board itself -- the caption drawn on
+    // the button that plays it. Takes precedence over an ExportAssets symbol
+    // name below, since it's what someone looking at the board actually sees.
+    let captions = swf_text::collect_sound_labels(&swf_buf.data, version);
+
     let stem =
         path.file_stem().and_then(|s| s.to_str()).unwrap_or("swf-soundboard").to_string();
     let out_dir = crate::persistence::data_dir().join("swf-sounds").join(unique_dir_name(&stem));
 
-    let result = rip_tags(&swf_buf.data, version, names, &stem, out_dir);
+    let result = rip_tags(&swf_buf.data, version, names, captions, &stem, out_dir);
 
     log::info!(
-        "ripped {} sound(s) from {} in {:?} ({} skipped, {} failed)",
+        "ripped {} sound(s) from {} in {:?} ({} named from the board, {} skipped, {} failed)",
         result.buttons.len(),
         path.display(),
         started.elapsed(),
+        result.labelled,
         result.skipped,
         result.failed
     );
@@ -91,6 +101,7 @@ fn rip_tags(
     data: &[u8],
     version: u8,
     names: HashMap<u16, String>,
+    captions: HashMap<u16, String>,
     stem: &str,
     out_dir: PathBuf,
 ) -> SwfRipResult {
@@ -98,6 +109,8 @@ fn rip_tags(
         out_dir,
         out_dir_created: false,
         names,
+        captions,
+        labelled: 0,
         buttons: Vec::new(),
         skipped: 0,
         skipped_codecs: Vec::new(),
@@ -122,6 +135,7 @@ fn rip_tags(
         skipped: ctx.skipped,
         skipped_codecs: ctx.skipped_codecs,
         failed: ctx.failed,
+        labelled: ctx.labelled,
     }
 }
 
@@ -129,6 +143,8 @@ struct RipContext {
     out_dir: PathBuf,
     out_dir_created: bool,
     names: HashMap<u16, String>,
+    captions: HashMap<u16, String>,
+    labelled: usize,
     buttons: Vec<ImportedButton>,
     skipped: usize,
     skipped_codecs: Vec<String>,
@@ -281,14 +297,20 @@ fn collect_names(data: &[u8], version: u8, depth: usize, names: &mut HashMap<u16
 
 fn handle_define_sound(ctx: &mut RipContext, sound: &swf::Sound) {
     ctx.counter += 1;
-    let label = ctx
-        .names
-        .get(&sound.id)
-        .cloned()
-        .unwrap_or_else(|| format!("Sound {}", ctx.counter));
+    // The caption on the button that plays this sound is what someone
+    // looking at the original board would call it, so it wins over the
+    // author's internal symbol name.
+    let named = ctx.captions.get(&sound.id).or_else(|| ctx.names.get(&sound.id)).cloned();
+    let from_board = named.is_some();
+    let label = named.unwrap_or_else(|| format!("Sound {}", ctx.counter));
 
     match extract_define_sound(ctx, &label, sound) {
-        Ok(Some(file)) => ctx.buttons.push(ImportedButton { label, file }),
+        Ok(Some(file)) => {
+            if from_board {
+                ctx.labelled += 1;
+            }
+            ctx.buttons.push(ImportedButton { label, file });
+        }
         Ok(None) => ctx.note_skipped(sound.format.compression),
         Err(e) => {
             // A decode/write failure is not an unsupported codec -- count it
@@ -579,7 +601,8 @@ mod tests {
         let version = swf_buf.header.version();
         let mut names = HashMap::new();
         collect_names(&swf_buf.data, version, 0, &mut names);
-        rip_tags(&swf_buf.data, version, names, "test", out.0.clone())
+        let captions = swf_text::collect_sound_labels(&swf_buf.data, version);
+        rip_tags(&swf_buf.data, version, names, captions, "test", out.0.clone())
     }
 
     /// A 4-bit mono ADPCM stream of zero codes, which decodes to `frames`
@@ -708,6 +731,71 @@ mod tests {
         assert_eq!(result.buttons[0].label, "laugh");
     }
 
+    /// The caption drawn on the board wins over the author's internal
+    /// symbol name, because it's what someone looking at the board sees.
+    #[test]
+    fn a_board_caption_beats_an_exported_symbol_name() {
+        let out = TempDir::new();
+
+        let mut export_body = Vec::new();
+        export_body.extend_from_slice(&1u16.to_le_bytes());
+        export_body.extend_from_slice(&3u16.to_le_bytes()); // the sound's id
+        export_body.extend_from_slice(b"snd_internal_47\0");
+
+        // DefineEditText id 2, carrying the visible caption.
+        let mut edit = Vec::new();
+        edit.extend_from_slice(&2u16.to_le_bytes());
+        edit.push(0x00); // empty RECT
+        edit.push(0x80); // HasText
+        edit.push(0x00);
+        edit.push(0x00); // empty VariableName
+        edit.extend_from_slice(b"THIS IS ANGEL\0");
+
+        // DefineButton2 id 4 placing character 2, and its sound mapping.
+        let mut btn = Vec::new();
+        btn.extend_from_slice(&4u16.to_le_bytes());
+        btn.push(0x00);
+        btn.extend_from_slice(&0u16.to_le_bytes());
+        btn.push(0x07);
+        btn.extend_from_slice(&2u16.to_le_bytes());
+        btn.extend_from_slice(&1u16.to_le_bytes());
+        btn.push(0x00);
+        btn.push(0x00);
+        btn.push(0x00);
+
+        let mut bsnd = Vec::new();
+        bsnd.extend_from_slice(&4u16.to_le_bytes());
+        bsnd.extend_from_slice(&0u16.to_le_bytes());
+        bsnd.extend_from_slice(&0u16.to_le_bytes());
+        bsnd.extend_from_slice(&3u16.to_le_bytes()); // over-to-down: sound 3
+        bsnd.push(0x00);
+        bsnd.extend_from_slice(&0u16.to_le_bytes());
+
+        let mut tags = Vec::new();
+        tags.extend_from_slice(&tag(56, &export_body));
+        tags.extend_from_slice(&tag(37, &edit));
+        tags.extend_from_slice(&tag(34, &btn));
+        tags.extend_from_slice(&tag(17, &bsnd));
+        tags.extend_from_slice(&tag(TAG_DEFINE_SOUND, &define_sound_body(3, 1, &adpcm_payload(9, 8), 8)));
+
+        let result = rip(&build_swf(&tags), &out);
+        assert_eq!(result.buttons.len(), 1);
+        assert_eq!(result.buttons[0].label, "THIS IS ANGEL");
+        assert_eq!(result.labelled, 1);
+    }
+
+    /// With no caption anywhere, the numbered fallback still applies and is
+    /// reported as not coming from the board.
+    #[test]
+    fn unnamed_sounds_fall_back_to_a_counter() {
+        let out = TempDir::new();
+        let swf = build_swf(&tag(TAG_DEFINE_SOUND, &define_sound_body(1, 1, &adpcm_payload(5, 8), 8)));
+
+        let result = rip(&swf, &out);
+        assert_eq!(result.buttons[0].label, "Sound 1");
+        assert_eq!(result.labelled, 0);
+    }
+
     /// Manual verification against a real .swf, the way
     /// `realm_of_darkness`'s live test works -- `#[ignore]`d so CI stays
     /// offline and fixture-free. Point it at a file and inspect the results:
@@ -735,11 +823,13 @@ mod tests {
         let _ = fs::remove_dir_all(&out);
 
         let started = std::time::Instant::now();
-        let result = rip_tags(&swf_buf.data, version, names, "fixture", out.clone());
+        let captions = swf_text::collect_sound_labels(&swf_buf.data, version);
+        let result = rip_tags(&swf_buf.data, version, names, captions, "fixture", out.clone());
         let elapsed = started.elapsed();
 
         println!("--- {} (SWF v{version}) ---", path.display());
         println!("extracted: {}", result.buttons.len());
+        println!("labelled:  {}", result.labelled);
         println!("skipped:   {} {:?}", result.skipped, result.skipped_codecs);
         println!("failed:    {}", result.failed);
         println!("elapsed:   {elapsed:?}");
@@ -749,7 +839,15 @@ mod tests {
             println!("  {:>8} B  {}", size, b.label);
         }
 
+        let unnamed = result.buttons.iter().filter(|b| b.label.starts_with("Sound ")).count();
+        println!("unnamed:   {unnamed}");
+
         assert!(!result.buttons.is_empty(), "extracted nothing from a real .swf");
+        assert_eq!(
+            result.labelled,
+            result.buttons.len(),
+            "{unnamed} sound(s) fell back to a numbered name"
+        );
     }
 
     #[test]

@@ -318,6 +318,7 @@ impl SoundboardApp {
         }
 
         let extracted = r.buttons.len();
+        let labelled = r.labelled;
         let leftovers = describe_leftovers(&r);
         let mut tab = TabModel::new(r.tab_name);
         tab.button_size = self.state.default_button_size;
@@ -332,11 +333,21 @@ impl SoundboardApp {
         self.mark_dirty();
 
         let plural = if extracted == 1 { "" } else { "s" };
+        // Say whether the names came off the board, so a board we couldn't
+        // read captions from is obvious rather than quietly numbered.
+        let naming = if labelled == extracted {
+            ", named from the board".to_string()
+        } else if labelled > 0 {
+            format!(", {labelled} named from the board")
+        } else {
+            String::new()
+        };
         if leftovers.is_empty() {
-            self.toasts.success(format!("Extracted {extracted} sound{plural} from the .swf"));
+            self.toasts
+                .success(format!("Extracted {extracted} sound{plural}{naming}"));
         } else {
             self.toasts
-                .warning(format!("Extracted {extracted} sound{plural}{leftovers}"));
+                .warning(format!("Extracted {extracted} sound{plural}{naming}{leftovers}"));
         }
     }
 
