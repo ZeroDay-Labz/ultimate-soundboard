@@ -59,9 +59,17 @@ proper cross-platform packaged app instead of a dev script.
   folder heuristics); other pages fall back to grabbing any audio links
   found on them.
 - **`.swf` ripper** -- drop an old Flash soundboard file on the app and it
-  pulls every embedded sound (MP3 and raw PCM) out into a new tab. This
-  only parses the SWF's static tag structure to copy out audio bytes --
-  there's no ActionScript interpreter anywhere in this app, so a
+  pulls every embedded sound out into a new tab, including sounds buried
+  inside movieclips and timeline audio. Decodes ADPCM (by far the most
+  common Flash sound format), MP3 and raw PCM, all in pure Rust -- no
+  ffmpeg, `swfextract` or any other tool to install. A malformed tag costs
+  that one sound rather than the whole import. Only Nellymoser and Speex
+  are skipped, and they're named when they are; both are microphone codecs
+  that essentially never appear in authored soundboards.
+
+  The ripper reads each tag's code and length and only looks inside the
+  handful of sound-related ones -- it never parses, let alone runs,
+  ActionScript. There's no AS interpreter anywhere in this app, so a
   malicious old soundboard's script has no way to run.
 - **Now-playing indicator, master volume + mute, drag-to-reorder tabs** --
   see it running rather than read about it.

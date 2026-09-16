@@ -65,7 +65,10 @@ pub struct SoundboardApp {
     clone_dialog_open: bool,
     clone_url: String,
     clone_job: Option<CloneJob>,
-    swf_job: Option<mpsc::Receiver<Result<SwfRipResult, String>>>,
+    /// One per in-flight `.swf` rip. A `Vec` rather than an `Option`
+    /// because dropping several files at once starts several rips, and a
+    /// single slot silently discarded all but the last.
+    swf_jobs: Vec<mpsc::Receiver<Result<SwfRipResult, String>>>,
     /// Which tab's sounds were last sent to the decode cache for
     /// background pre-warming (see `AudioEngine::prewarm`). Re-checked
     /// every frame against the current tab so switching tabs (or editing
@@ -133,7 +136,7 @@ impl SoundboardApp {
             clone_dialog_open: false,
             clone_url: String::new(),
             clone_job: None,
-            swf_job: None,
+            swf_jobs: Vec::new(),
             prewarmed_tab: None,
             prewarmed_button_count: 0,
             prewarmed_pitch: 0,
@@ -269,47 +272,71 @@ impl SoundboardApp {
             let result = importers::swf_rip::extract_sounds(&path).map_err(|e| format!("{e:#}"));
             let _ = tx.send(result);
         });
-        self.swf_job = Some(rx);
+        self.swf_jobs.push(rx);
     }
 
-    fn poll_swf_job(&mut self) {
-        let Some(rx) = &self.swf_job else { return };
-        let Ok(result) = rx.try_recv() else { return };
-        self.swf_job = None;
+    /// Drains every finished rip. Several `.swf` files can be in flight at
+    /// once, so this collects all ready results rather than just one.
+    fn poll_swf_jobs(&mut self) {
+        if self.swf_jobs.is_empty() {
+            return;
+        }
 
-        match result {
-            Ok(r) => {
-                if r.buttons.is_empty() {
-                    self.toasts.warning(format!(
-                        "No usable sounds found in {} ({} skipped, unsupported codec)",
-                        r.tab_name, r.skipped
-                    ));
-                    return;
-                }
-                let extracted = r.buttons.len();
-                let mut tab = TabModel::new(r.tab_name);
-                tab.button_size = self.state.default_button_size;
-                for b in r.buttons {
-                    let mut btn = ButtonModel::new(b.label, b.file);
-                    btn.width = tab.button_size;
-                    btn.height = tab.button_size;
-                    tab.buttons.push(btn);
-                }
-                self.state.tabs.push(tab);
-                self.state.current_tab = self.state.tabs.len() - 1;
-                self.mark_dirty();
-
-                if r.skipped > 0 {
-                    let codecs = r.skipped_codecs.iter().collect::<std::collections::HashSet<_>>();
-                    let codec_list = codecs.into_iter().cloned().collect::<Vec<_>>().join(", ");
-                    self.toasts.warning(format!("Extracted {extracted} sounds, skipped {} ({codec_list} not supported)", r.skipped));
-                } else {
-                    self.toasts.success(format!("Extracted {extracted} sound{} from the .swf", if extracted == 1 { "" } else { "s" }));
-                }
+        let mut finished = Vec::new();
+        self.swf_jobs.retain(|rx| match rx.try_recv() {
+            Ok(result) => {
+                finished.push(result);
+                false
             }
+            // Keep waiting; a disconnected channel means the worker died
+            // without sending, so drop it rather than leak the slot.
+            Err(mpsc::TryRecvError::Empty) => true,
+            Err(mpsc::TryRecvError::Disconnected) => false,
+        });
+
+        for result in finished {
+            self.finish_swf_rip(result);
+        }
+    }
+
+    fn finish_swf_rip(&mut self, result: Result<SwfRipResult, String>) {
+        let r = match result {
+            Ok(r) => r,
             Err(e) => {
                 self.toasts.error(format!("SWF rip failed: {e}"));
+                return;
             }
+        };
+
+        if r.buttons.is_empty() {
+            self.toasts.warning(format!(
+                "No usable sounds found in {}{}",
+                r.tab_name,
+                describe_leftovers(&r)
+            ));
+            return;
+        }
+
+        let extracted = r.buttons.len();
+        let leftovers = describe_leftovers(&r);
+        let mut tab = TabModel::new(r.tab_name);
+        tab.button_size = self.state.default_button_size;
+        for b in r.buttons {
+            let mut btn = ButtonModel::new(b.label, b.file);
+            btn.width = tab.button_size;
+            btn.height = tab.button_size;
+            tab.buttons.push(btn);
+        }
+        self.state.tabs.push(tab);
+        self.state.current_tab = self.state.tabs.len() - 1;
+        self.mark_dirty();
+
+        let plural = if extracted == 1 { "" } else { "s" };
+        if leftovers.is_empty() {
+            self.toasts.success(format!("Extracted {extracted} sound{plural} from the .swf"));
+        } else {
+            self.toasts
+                .warning(format!("Extracted {extracted} sound{plural}{leftovers}"));
         }
     }
 
@@ -1250,7 +1277,7 @@ impl eframe::App for SoundboardApp {
         }
 
         self.handle_drops(&ctx);
-        self.poll_swf_job();
+        self.poll_swf_jobs();
         self.tab_delete_dialog(&ctx);
 
         if self.toasts.show(&ctx) {
@@ -1310,4 +1337,27 @@ fn setup_global_space_hotkey() -> (Option<GlobalHotKeyManager>, Option<u32>, boo
             (None, None, false)
         }
     }
+}
+
+/// Describes what a rip couldn't take, for the tail of the toast. Skipped
+/// (codec we don't decode) and failed (we understood it but couldn't write
+/// it) are reported separately so a disk error can't read as a codec
+/// problem. Returns an empty string when everything came through.
+fn describe_leftovers(r: &SwfRipResult) -> String {
+    let mut parts = Vec::new();
+
+    if r.skipped > 0 {
+        let mut codecs: Vec<&str> = Vec::new();
+        for codec in &r.skipped_codecs {
+            if !codecs.contains(&codec.as_str()) {
+                codecs.push(codec);
+            }
+        }
+        parts.push(format!("skipped {} ({})", r.skipped, codecs.join(", ")));
+    }
+    if r.failed > 0 {
+        parts.push(format!("{} failed to save", r.failed));
+    }
+
+    if parts.is_empty() { String::new() } else { format!(", {}", parts.join(", ")) }
 }

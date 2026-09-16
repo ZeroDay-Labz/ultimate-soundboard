@@ -1,4 +1,5 @@
 pub mod realm_of_darkness;
+pub mod swf_adpcm;
 pub mod swf_rip;
 pub mod url_cloner;
 
