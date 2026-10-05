@@ -32,6 +32,10 @@ finish-args:
   - --device=dri
   # Audio output (PipeWire's PulseAudio-compatible socket)
   - --socket=pulseaudio
+  # Clone URL downloads sounds from the page you paste; without this the
+  # sandbox has no network at all and every clone fails. Nothing else in
+  # the app makes a network request.
+  - --share=network
   # Global Space-to-stop-all and per-button hotkeys need real X11 key
   # access (see src/ui/app.rs -- this is a documented Wayland limitation
   # of the `global-hotkey` crate, not something the sandbox can fix).
