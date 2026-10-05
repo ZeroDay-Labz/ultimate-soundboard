@@ -3,6 +3,22 @@
 All notable changes to Ultimate Soundboard are recorded here. Versions
 follow [semantic versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- The Flatpak build had no network permission, so Clone URL could never
+  reach a site from inside the sandbox. The manifest now grants
+  `--share=network`.
+
+### Changed
+
+- The `ULTIMATE_SOUNDBOARD_SCREENSHOT` hook takes an optional
+  `ULTIMATE_SOUNDBOARD_SCREENSHOT_VIEW` (`clone`, `hotkeys` or `settings`)
+  to capture a dialog rather than the bare board, and
+  `ULTIMATE_SOUNDBOARD_SCREENSHOT_SIZE` (`1280x800`) to size the window
+  first. The README's screenshots are generated this way.
+
 ## [0.2.1] - 2026-09-16
 
 ### Added

@@ -443,8 +443,32 @@ impl SoundboardApp {
     /// compositor, whereas external X11 grabbers capture pure black for
     /// anything composited by Wayland, which makes "does this actually
     /// look right" otherwise unanswerable on a modern Linux desktop.
+    ///
+    /// `ULTIMATE_SOUNDBOARD_SCREENSHOT_VIEW` picks a dialog to have open
+    /// in the shot (`clone`, `hotkeys` or `settings`); unset captures the
+    /// bare board, and `ULTIMATE_SOUNDBOARD_SCREENSHOT_SIZE=1280x800` sets
+    /// the window size first. This is how the README's screenshots are made.
     fn handle_screenshot_hook(&mut self, ctx: &egui::Context) {
         let Ok(path) = std::env::var("ULTIMATE_SOUNDBOARD_SCREENSHOT") else { return };
+
+        if self.screenshot_frames == 0 {
+            match std::env::var("ULTIMATE_SOUNDBOARD_SCREENSHOT_VIEW").as_deref() {
+                Ok("clone") => {
+                    self.clone_dialog_open = true;
+                    self.clone_url = "https://www.realmofdarkness.net/sb/sw-vader/".to_string();
+                }
+                Ok("hotkeys") => self.hotkeys_panel_open = true,
+                Ok("settings") => self.settings_open = true,
+                _ => {}
+            }
+            let size = std::env::var("ULTIMATE_SOUNDBOARD_SCREENSHOT_SIZE").ok().and_then(|s| {
+                let (w, h) = s.split_once('x')?;
+                Some(egui::vec2(w.trim().parse().ok()?, h.trim().parse().ok()?))
+            });
+            if let Some(size) = size {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            }
+        }
 
         self.screenshot_frames += 1;
         ctx.request_repaint();
